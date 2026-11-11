@@ -112,7 +112,10 @@ A(/owns the more privileged app/.test(rep), "report explains the ownership path"
 
 // ---------- PARTNER fixture (raw Graph shape: accessDetails.unifiedRoles GUIDs) ----------
 sb.__partner = partner;
-const rp = vm.runInContext("analyzePartner(__partner)", sb);
+// pin the clock to the export time: relationship expiry is relative to "now", and a wall
+// clock turns this frozen fixture into a time bomb (Borealis ends 2026-11-01)
+sb.__pnow = Date.parse(partner.generatedAt);
+const rp = vm.runInContext("analyzePartner(__partner, {now: __pnow})", sb);
 const cust = id => rp.custList.find(c=>c.id===id);
 A(rp.roll.customers === 3, "partner fixture parses 3 customers ("+rp.roll.customers+")");
 A(cust("cust-acme-0001").sev === "direct", "Acme (GA via GUID role) => full takeover, raw shape resolved");
@@ -136,6 +139,139 @@ A(vm.runInContext("typeof analyzeTenant", sbPub) === "undefined" && vm.runInCont
   "public build contains no tenant engine or tenant sample");
 A(vm.runInContext("analyzeApp(['RoleManagement.ReadWrite.Directory'].map(resolvePerm), [], 'single-tenant').sev", sbPub) === "direct",
   "public build still classifies a single app (RoleManagement.ReadWrite.Directory => direct)");
+
+// ---------- knowledge base vs azure-tiering snapshot ----------
+// A Tier-0 permission missing from the KB is silently dropped ("no known path"),
+// the failure this project ranks worst. Snapshots live in test/data and are
+// refreshed with scripts/sync_azure_tiering.py; every change there gets reviewed.
+const snap = name => { const f = path.join(ROOT, "test", "data", name); return fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, "utf8")) : null; };
+const want = pt => pt === "Direct" ? "direct" : "conditional";   // Indirect and untested/legacy ("n/a") => at least conditional
+const atLeast = (have, need) => need === "direct" ? have === "direct" : have === "direct" || have === "conditional";
+{
+  const g = snap("azure-tiering-graph-tier0.json");
+  const kbPerm = id => vm.runInContext(`PERMISSIONS.find(p => p.id === ${JSON.stringify(id)}) || null`, sb);
+  const missing = [], wrongGuid = [], tooLow = [];
+  g.tier0.forEach(e => {
+    const p = kbPerm(e.assetName);
+    if (!p) return missing.push(e.assetName);
+    if ((p.guid || "").toLowerCase() !== e.id.toLowerCase()) wrongGuid.push(`${e.assetName} (kb ${p.guid}, azure-tiering ${e.id})`);
+    if (!atLeast(p.escalation, want(e.pathType))) tooLow.push(`${e.assetName}: kb ${p.escalation}, azure-tiering ${e.pathType}`);
+  });
+  A(missing.length === 0, `every azure-tiering Graph Tier-0 permission is in the KB (snapshot ${g.snapshot})${missing.map(x => "\n       missing: " + x).join("")}`);
+  A(wrongGuid.length === 0, `KB permission GUIDs match azure-tiering${wrongGuid.map(x => "\n       " + x).join("")}`);
+  A(tooLow.length === 0, `no KB permission is rated below azure-tiering${tooLow.map(x => "\n       " + x).join("")}`);
+  A(g.tier0.every(e => vm.runInContext(`resolvePerm(${JSON.stringify(e.id)})`, sb)),
+    "every Tier-0 permission resolves from a GUID-only export");
+}
+{
+  const r = snap("azure-tiering-entra-tier0.json");
+  if (!r) console.log("WARN no Entra roles snapshot yet (test/data/azure-tiering-entra-tier0.json): run `py scripts/sync_azure_tiering.py` (python3 on macOS/Linux); roles are NOT checked against azure-tiering");
+  else {
+    const kbRole = n => vm.runInContext(`ROLES.find(x => x.id.toLowerCase() === ${JSON.stringify(n.toLowerCase())}) || null`, sb);
+    const missing = [], unmapped = [], tooLow = [];
+    r.tier0.forEach(e => {
+      const k = kbRole(e.assetName);
+      if (!k) return missing.push(e.assetName);
+      if (vm.runInContext(`(resolveRole(${JSON.stringify(e.id)})||{}).id`, sb) !== k.id) unmapped.push(`${e.assetName} (${e.id})`);
+      if (!atLeast(k.escalation, want(e.pathType))) tooLow.push(`${e.assetName}: kb ${k.escalation}, azure-tiering ${e.pathType}`);
+    });
+    A(missing.length === 0, `every azure-tiering Entra Tier-0 role is in the KB (snapshot ${r.snapshot})${missing.map(x => "\n       missing: " + x).join("")}`);
+    A(unmapped.length === 0, `every Tier-0 role template ID maps to its KB role${unmapped.map(x => "\n       " + x).join("")}`);
+    A(tooLow.length === 0, `no KB role is rated below azure-tiering${tooLow.map(x => "\n       " + x).join("")}`);
+  }
+}
+
+// ---------- 2026.11.11 KB additions behave in the engine ----------
+const variant = mutateFn => { const d = JSON.parse(JSON.stringify(tenant)); mutateFn(d); sb.__var = d; return vm.runInContext("analyzeTenant(__var, {now: Date.parse('2026-10-22T12:00:00Z')})", sb); };
+const spOf = (d, id) => d.servicePrincipals.find(s => s.id === id);
+{
+  const r = variant(d => { spOf(d, "sp-0002").appRoles = ["Application.ReadUpdate.All"]; });
+  A(get(r, "sp-0002").finalSev === "direct" && get(r, "sp-0002").confirmedViaChain,
+    "Application.ReadUpdate.All plants credentials like Application.ReadWrite.All (confirmed via chain)");
+}
+{
+  const single = ps => vm.runInContext(`analyzeApp(${JSON.stringify(ps)}.map(resolvePerm), [], 'multi-tenant')`, sb);
+  A(single(["UserAuthMethod-TAP.ReadWrite.All"]).sev === "direct", "a TAP-only app is a direct path, not 'no known path'");
+  A(single(["DelegatedAdminRelationship.ReadWrite.All"]).sev === "direct", "DelegatedAdminRelationship.ReadWrite.All is a direct (cross-tenant) path");
+  A(vm.runInContext("isLockoutOnly", sb)(single(["User.DeleteRestore.All"])), "User.DeleteRestore.All alone is a lockout, not a GA path");
+  A(!vm.runInContext("isLockoutOnly", sb)(single(["User.DeleteRestore.All", "RoleManagement.ReadWrite.Directory"])),
+    "lockout plus a real GA permission is a GA path");
+}
+{
+  const r = variant(d => { spOf(d, "sp-0005").appRoles.push("Policy.ReadWrite.ConditionalAccess"); });
+  A(get(r, "sp-0005").finalSev === "direct" && get(r, "sp-0005").lockoutOnly === true, "Conditional Access writer => lockout, labeled as such");
+  A(r.roll.lockout === 1 && r.roll.ga === rt.roll.ga, `rollup counts lockout separately from GA (ga ${r.roll.ga}, lockout ${r.roll.lockout})`);
+  A(get(r, "sp-0002").lockoutOnly === false, "an app that can backdoor both a lockout app and a GA app is a GA path");
+}
+{
+  // a backdoor whose only privileged target is a lockout app inherits the lockout, not GA
+  const r = variant(d => {
+    d.servicePrincipals = d.servicePrincipals.filter(s => ["sp-0002", "sp-0005"].includes(s.id));
+    spOf(d, "sp-0005").appRoles = ["User.EnableDisableAccount.All", "User.Read.All"];
+    d.groups = [];
+  });
+  A(get(r, "sp-0002").finalSev === "direct" && get(r, "sp-0002").lockoutOnly === true,
+    "backdooring a lockout-only app is reported as a lockout, not as reaching Global Admin");
+}
+{
+  const r = variant(d => { const sp = spOf(d, "sp-0006"); sp.directoryRoles = ["d29b2b05-8046-44ba-8758-1e26182fcf32"]; });
+  A(get(r, "sp-0006").roleObjs.some(x => x.id === "Directory Synchronization Accounts"), "Directory Synchronization Accounts resolves from its template ID");
+  A(!get(r, "sp-0006").canModAll, "Directory Synchronization Accounts is no longer treated as able to plant app credentials");
+}
+
+// ---------- engine edges come from the KB, not from names in app.js ----------
+{
+  const src = fs.readFileSync(path.join(ROOT, "app.js"), "utf8");
+  const engine = src.slice(0, src.indexOf("const SCRIPT_TEXT"));   // export scripts and samples follow
+  const hits = engine.match(/(\.has\(|===\s*|\.includes\()"[A-Z][A-Za-z]+(?:[.-][A-Za-z]+)+"/g) || [];
+  A(hits.length === 0, `engine code names no specific permission or role (use KB fields)${hits.map(h => "\n       " + h).join("")}`);
+  const allowed = { plantsCredentials: ["any", "owned"], selfEscalates: [true], writesOpenGroups: [true], impact: ["availability"] };
+  const bad = vm.runInContext("PERMISSIONS.concat(ROLES)", sb).flatMap(x =>
+    Object.keys(allowed).filter(f => f in x && !allowed[f].includes(x[f])).map(f => `${x.id}.${f}=${x[f]}`));
+  const noTid = vm.runInContext("ROLES.filter(r => !r.templateId).map(r => r.id)", sb);
+  A(noTid.length === 0, `every KB role carries its template ID${noTid.map(x => "\n       " + x).join("")}`);
+  A(bad.length === 0, `KB edge fields use known values${bad.map(b => "\n       " + b).join("")}`);
+}
+{
+  const r = variant(d => { spOf(d, "sp-0005").appRoles = ["Policy.ReadWrite.PermissionGrant"]; });
+  A(get(r, "sp-0005").finalSev === "direct", "Policy.ReadWrite.PermissionGrant self-escalates in tenant mode (grants itself RoleManagement)");
+  const r2 = variant(d => { spOf(d, "sp-0005").appRoles = ["PrivilegedAssignmentSchedule.ReadWrite.EntraAppRole"]; });
+  A(get(r2, "sp-0005").finalSev === "direct", "PrivilegedAssignmentSchedule.ReadWrite.EntraAppRole self-escalates in tenant mode");
+  const r3 = variant(d => { spOf(d, "sp-0005").appRoles = ["User.Read.All"]; spOf(d, "sp-0005").directoryRoles = ["4ba39ca4-527c-499a-b93d-d9b492c50246"]; });
+  A(get(r3, "sp-0005").finalSev === "direct" && get(r3, "sp-0005").confirmedViaChain, "Partner Tier1 Support plants app credentials (confirmed via chain)");
+  // Application Administrator is Indirect (conditional) on its own; tenant mode confirms the chain
+  const withApp = variant(d => { const sp = spOf(d, "sp-0005"); sp.appRoles = ["User.Read.All"]; sp.directoryRoles = ["9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3"]; });
+  A(get(withApp, "sp-0005").finalSev === "direct" && get(withApp, "sp-0005").confirmedViaChain,
+    "Application Administrator => direct when the tenant has a privileged app to backdoor (confirmed via chain)");
+  const noTarget = variant(d => {
+    d.servicePrincipals = d.servicePrincipals.filter(s => s.id === "sp-0005"); d.groups = [];
+    const sp = spOf(d, "sp-0005"); sp.appRoles = ["User.Read.All"]; sp.directoryRoles = ["9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3"];
+  });
+  A(get(noTarget, "sp-0005").finalSev === "conditional", "Application Administrator => conditional when no privileged app exists to backdoor");
+  const role = n => vm.runInContext(`analyzeApp([], [resolveRole(${JSON.stringify(n)})], 'multi-tenant')`, sb);
+  A(vm.runInContext("isLockoutOnly", sb)(role("Conditional Access Administrator")), "Conditional Access Administrator is a lockout, labeled as such");
+  A(vm.runInContext("isLockoutOnly", sb)(role("Security Administrator")) && role("Security Administrator").sev === "direct", "Security Administrator: direct, lockout-labeled");
+  A(role("Tenant Governance Administrator").sev === "direct" && !vm.runInContext("isLockoutOnly", sb)(role("Tenant Governance Administrator")), "Tenant Governance Administrator is a real Global Admin path");
+}
+
+// ---------- v0.9.2: modes agree; gaps that switch checks off are surfaced ----------
+{
+  const self = vm.runInContext("PERMISSIONS.filter(p => p.selfEscalates).map(p => p.id)", sb);
+  const disagree = self.filter(id => {
+    const single = vm.runInContext(`analyzeApp([resolvePerm(${JSON.stringify(id)})], [], 'multi-tenant').sev`, sb);
+    const r = variant(d => { spOf(d, "sp-0005").appRoles = [id]; });
+    return single !== "direct" || get(r, "sp-0005").finalSev !== "direct";
+  });
+  A(self.length >= 3 && disagree.length === 0, `self-escalating permissions are direct in both single-app and tenant mode (${self.length})${disagree.map(x => "\n       " + x).join("")}`);
+}
+{
+  const r = variant(d => { delete d.tenantId; });
+  A(r.warnings.some(w => w.code === "no-tenant-id"), "an export without tenantId carries a no-tenant-id warning");
+  A(variant(() => {}).warnings.length === 0, "a complete export carries no warnings");
+  sb.__noTid = r; vm.runInContext("tenantData = __noTid", sb);
+  const rep2 = vm.runInContext("buildReportHTML('tenant')", sb);
+  A(/Check not run\./.test(rep2) && /no tenantId/.test(rep2), "the report states that the cross-tenant checks did not run");
+}
 
 console.log(`\n${ok} passed, ${fail} failed`);
 process.exit(fail?1:0);

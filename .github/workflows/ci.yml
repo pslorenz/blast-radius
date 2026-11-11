@@ -5,29 +5,41 @@ on:
     branches: [main]
   pull_request:
 
-permissions:
-  contents: read
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Exact version, at least two weeks old when bumped. playwright depends on exactly
+  # one package (playwright-core, same version), so this pin fixes the whole tree.
+  PLAYWRIGHT_VERSION: "1.63.0"
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  test:
+    runs-on: ubuntu-24.04      # pinned image: python3 3.12 and node 20 are preinstalled
+    timeout-minutes: 10
     permissions:
       contents: read
-      id-token: write      # build-provenance attestation
-      attestations: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
-          python-version: "3.12"
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
+          persist-credentials: false
+
+      - name: Toolchain
+        run: python3 --version && node --version
+
+      - name: Actions pinned to commit SHAs (warning here; release.yml enforces)
+        run: python3 scripts/check_pinned_actions.py --warn
 
       - name: Engine tests (fixtures through the real engine)
         run: node test/fixture.test.js
 
-      - name: Build (fails on missing CSP, external resources, leaked tenant code)
+      - name: Hostile-input tests (attacker-controlled names and ids stay inert)
+        run: node test/hostile-input.test.js
+
+      - name: Build (fails on missing CSP, unhashed scripts, inline handlers, external resources, leaked tenant code)
         run: python3 build.py
 
       - name: Built files must match source
@@ -41,9 +53,44 @@ jobs:
       - name: Verify hashes
         run: sha256sum -c SHA256SUMS
 
+  browser:
+    # The built files in a real browser: CSP covers the page's own scripts, nothing
+    # leaves file://, hostile exports stay inert, reports are script-free.
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install Playwright ${{ env.PLAYWRIGHT_VERSION }} and Chromium
+        run: |
+          npm install --no-save --no-package-lock --ignore-scripts "playwright@${PLAYWRIGHT_VERSION}"
+          npx --no-install playwright install --with-deps chromium
+      - name: Browser tests
+        run: node test/browser.test.js
+
+  attest-main:
+    # Provenance for the files people download straight from main (README route).
+    # Tagged releases are attested separately by release.yml.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test, browser]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Rebuild and confirm it matches what is committed
+        run: python3 build.py && git diff --exit-code -- blast-radius-local.html blast-radius-public.html SHA256SUMS
       - name: Attest build provenance
-        if: github.event_name == 'push'
-        uses: actions/attest-build-provenance@v1
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be  # v2
         with:
           subject-path: |
             blast-radius-local.html
