@@ -1,6 +1,6 @@
 # Blast Radius: a proof-of-concept Entra app permission analyzer
 
-Blast Radius tells you what happens when an Entra (Azure AD) application's credential is stolen. It answers three questions: what the attacker can reach, whether they can escalate to Global Admin, and which compensating controls actually help. I built it in response to the October 2026 ConnectWise Cloud Backup (formerly SkyKick) vendor-credential incident, and to the next one like it.
+Blast Radius tells you what happens when an Entra (Azure AD) application's credential is stolen. It answers three questions: what the attacker can reach, whether they can escalate to Global Admin, and which compensating controls actually help. I built it in response to the October 2026 ConnectWise Cloud Backup (formerly SkyKick) vendor-credential incident, and to the next one like it (and there's been at least one more oops since.) This is also a response to a known gap where not everyone knows what those permissions can do when staring at a new consent screen.
 
 The tool runs entirely in your browser. It collects no data and makes no network calls.
 
@@ -12,21 +12,31 @@ The tool runs entirely in your browser. It collects no data and makes no network
 
 The public build does less on purpose. Asking people to paste tenant exports into a random web page and promising "trust me bro, I'm not gathering data" is not responsible, and the industry needs to stop reinforcing that habit. The public build at https://pslorenz.github.io/blast-radius/ is a before-you-consent checker: pick or paste the permissions an app is requesting and see its blast radius before you grant anything.
 
-The offline build adds whole-tenant analysis and GDAP partner mapping. It is meant for data you should never paste into someone else's URL, so don't host it publicly either. Run it from a local file or from hosting you control.
+The offline build adds whole-tenant analysis and GDAP partner mapping. It is meant for data you should never paste into some random guy's website, so don't host it publicly either. Run it from a local file or from hosting you control.
 
 ## Running the offline build
 
-Download `blast-radius-local.html` from this repository (or from a tagged release, once there is one) and open it in any modern browser, either by double-clicking it or through `file://`. The read-only PowerShell export scripts that produce tenant and GDAP data are embedded in the tool itself. The tenant export uses the Microsoft Graph PowerShell SDK and needs `Application.Read.All`, `Directory.Read.All`, and `RoleManagement.Read.Directory`.
+Download `blast-radius-local.html` from the latest [release](https://github.com/pslorenz/blast-radius/releases) and open it in any modern browser, either by double-clicking it or through `file://`. The read-only PowerShell export scripts that produce tenant and GDAP data are embedded in the tool itself. The tenant export uses the Microsoft Graph PowerShell SDK and needs `Application.Read.All`, `Directory.Read.All`, and `RoleManagement.Read.Directory`.
 
 ## Verifying what you run
 
-Check the file before you paste client data into it. The repository carries a `SHA256SUMS` file that the build regenerates every time. Compare it against your download with `Get-FileHash .\blast-radius-local.html -Algorithm SHA256` on Windows or `sha256sum -c SHA256SUMS` on Linux and macOS.
+Check the file before you paste client data into it. Each release ships a `SHA256SUMS` file. Compare it against your download with `Get-FileHash .\blast-radius-local.html -Algorithm SHA256` on Windows or `sha256sum -c SHA256SUMS` on Linux and macOS.
 
-You don't have to take the no-network claim on faith either. Both builds carry a Content Security Policy that blocks every outbound connection, and the exported reports carry one too. Open DevTools, watch the Network tab while you analyze a tenant, and confirm nothing leaves.
+Because I'm a huge fan of over doing things, you should verify build provenance with the GitHub CLI:
+
+```
+gh attestation verify blast-radius-local.html --repo pslorenz/blast-radius --signer-workflow pslorenz/blast-radius/.github/workflows/release.yml
+```
+
+This confirms the file was built by this repository's release workflow from a tagged commit, after the tests passed to prove origin and integrity.
+
+Both builds carry a Content Security Policy that blocks outbound connections and lets only the page's own scripts run, and the exported reports allow no script at all. CI loads both builds in a headless browser and fails if anything tries to leave the file. To confirm for yourself, open DevTools, watch the Network tab while you analyze a payload.
 
 ## What's inside
 
-The core is a knowledge base of Entra application permissions and directory roles, classified into escalation tiers that mirror public research and Microsoft documentation. Every app gets a three-state Global Admin verdict: direct, conditional, or no known path.
+The core is a knowledge base of Entra application permissions and directory roles, classified into escalation tiers that mirror public research and Microsoft documentation. Every app gets a Global Admin verdict: direct, conditional, or no known path. A fourth outcome, lockout, marks permissions and roles that can lock every account out of the tenant (a ransom vector) without conferring Global Admin's privileges; they're shown and counted separately so they don't inflate the Global Admin count.
+
+Verdicts can change between versions as the knowledge base follows new research. [CHANGELOG.md](CHANGELOG.md) lists what changed in each release, starting with the verdicts most likely to differ from an earlier report. There are some gaps, because I wasn't tracking everything early on. 
 
 The offline build resolves takeover chains transitively. It follows one app planting a credential on another, ownership of an app registration or service principal, group membership and role-assignable group paths, and GDAP reach across customer tenants. Paths that run through a PIM-eligible role, on the app itself or on a role-assignable group, get their own PIM-gated verdict: still a path, ranked below standing access.
 
@@ -36,9 +46,9 @@ Both builds rank compensating controls by effort, license requirement, and effec
 
 ## What it doesn't see
 
-Blast Radius reasons about configuration, not activity. It cannot tell you what an attacker actually did, and unless Microsoft Graph activity logs were enabled before the incident, directory reads leave nothing for anyone else to find either. The "changed since" filter only sees credentials, because role assignments, group memberships, and consent grants carry no creation date in the export; use the directory audit log for those. The export does not read Conditional Access policy state, Azure RBAC on subscriptions, or app-role and access-package assignments that flow through non-role-assignable groups. Treat every verdict as a floor on the blast radius, never a ceiling.
+Blast Radius reasons about configuration, not activity. It cannot tell you what an attacker actually did, and unless Microsoft Graph activity logs were enabled before the incident, directory reads leave nothing for anyone else to find either. The "changed since" filter only sees credentials, because role assignments, group memberships, and consent grants carry no creation date in the export; use the directory audit log for those. If an export has no `tenantId`, the tool can't tell vendor apps from your own and says so: the cross-tenant credential checks don't run. The export does not read Conditional Access policy state, Azure RBAC on subscriptions, or app-role and access-package assignments that flow through non-role-assignable groups. Treat every verdict as a floor on the blast radius, never a ceiling.
 
-The knowledge base carries a date. The tool shows its age in the header and stamps it on every exported report, and it warns once the knowledge base is more than 90 days old. A verdict is only as current as the research behind it.
+The knowledge base is date stamped. The tool shows its age in the header and stamps it on every exported report, and it warns once the knowledge base is more than 90 days old. A verdict is only as current as the research behind it.
 
 ## Sources and further research
 
