@@ -16,7 +16,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'none'; frame-src 'self' about:; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-wIXn14E3epzXtDbGZTY4ueUKGvpzF7UL5gbK4ZEs47U=' 'sha256-9hrsB+Ud0s3c8ME90ShpFcFhPATKZnvHiQDbal8ZRQI='; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'none'; frame-src 'self' about:; base-uri 'none'; form-action 'none'">
 <title>Blast Radius: Entra app permission analyzer</title>
 <style>
 /* ============================ TOKENS ============================ */
@@ -737,11 +737,19 @@ h1 .sub { color: var(--text-faint); font-weight: 500; }
 //   "conditional" -> Tier-0 "Indirect": reaches GA/equiv, but depends on other
 //                    objects in the tenant (a combination or a target object)
 //   "none"        -> no known escalation path from this permission by itself
+// impact: "availability" marks a Direct entry whose Global-Admin-level effect is
+//   locking everyone out (a ransom vector), not gaining Global Admin's privileges.
+// Roles carry templateId (Microsoft's role template GUID) so GUID-only exports and
+//   GDAP relationships resolve; the engine builds its lookup from these.
+// Engine edges (read by the tenant engine; never hardcode names in app.js):
+//   plantsCredentials: "any" | "owned"  can add a credential to any app / apps it owns
+//   selfEscalates: true                 can grant itself a Direct permission, no tenant dependency
+//   writesOpenGroups: true              can change membership of non-role-assignable groups
 // tier: 1 = tenant-takeover class, 2 = broad data / sensitive, 3 = scoped
 // guid: Graph appRoleId where known, so exports carrying only GUIDs still match.
 // ============================================================================
 
-const KB_VERSION = "2026.10.22b";
+const KB_VERSION = "2026.11.11b";
 
 // Knowledge-base freshness. KB_VERSION is YYYY.MM.DD plus an optional revision letter.
 const KB_STALE_DAYS = 90;
@@ -751,7 +759,7 @@ function kbIsStale() { return kbAgeDays() > KB_STALE_DAYS; }
 function kbDateLabel() { return KB_DATE.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" }); }
 function kbAgeLabel() { const d = kbAgeDays(); return `updated ${kbDateLabel()}, ${d} day${d === 1 ? "" : "s"} old`; }
 
-const TOOL_VERSION = "0.9.1";
+const TOOL_VERSION = "0.9.2";
 // Classification changes are security-sensitive. A wrong "no known path" is worse
 // than a wrong "exposed". Record notable KB changes here so a defender can tell
 // whether a verdict from a prior run still holds:
@@ -763,6 +771,46 @@ const TOOL_VERSION = "0.9.1";
 //    registration owners exported; Windows PowerShell 5.1 credential dates parsed;
 //    unverified incident details removed from the Exchange Administrator and
 //    credential-audit entries; Graph read-logging claims corrected.
+//  2026.11.11 (v0.9.2): re-synced with azure-tiering (Graph Tier-0 snapshot in
+//    test/data, checked by test/fixture.test.js). Added 13 Tier-0 permissions that
+//    were silently dropped: UserAuthMethod-TAP/-Phone/-QR/-HardwareOATH.ReadWrite.All
+//    and DelegatedAdminRelationship.ReadWrite.All (direct); Application.ReadUpdate.All
+//    (now also a credential-planting edge in the tenant engine),
+//    DeviceManagementScripts.ReadWrite.All, SignInIdentifier.ReadWrite.All,
+//    Group-OnPremisesSyncBehavior.ReadWrite.All, SecurityIdentitiesActions.ReadWrite.All
+//    (conditional); Synchronization.ReadWrite.All and the two legacy
+//    PrivilegedAccess.ReadWrite.* permissions (conditional, kept for safety).
+//    User.DeleteRestore.All, User.EnableDisableAccount.All and
+//    Policy.ReadWrite.ConditionalAccess stay Direct but are now marked
+//    impact:"availability": Global-Admin-level lockout, not a privilege path; text
+//    corrected. Groups Administrator text corrected (cannot touch role-assignable
+//    groups). Partner Tier1/Tier2 Support marked retired. Domain Name Administrator,
+//    Directory Synchronization Accounts and Partner Tier1 Support added.
+//  2026.11.11b (v0.9.2): synced to azure-tiering's live Tier-0 lists (57 Graph
+//    permissions, 33 Entra roles; snapshots with published attack paths in
+//    test/data). Added 18 permissions (agent identity, PIM-for-app-roles, recovery
+//    policy, certificate IDs, passkey/method deletion, User.Create/ReadUpdate,
+//    and others) and 18 roles (Conditional Access Admin and Tenant Governance Admin
+//    direct; Authentication Admin, Agent ID/AI Admin, Customer Delegated Admin
+//    Relationship Admin, Entra Backup Admin, Directory Writers and the "same as
+//    Directory Writers" family conditional). SignInIdentifier.ReadWrite.All and
+//    Security Administrator now Direct (availability); HardwareOATH lowered to
+//    conditional per its published path. User Administrator, Helpdesk, Exchange,
+//    SharePoint, Groups, Hybrid Identity, Intune and Partner Tier1 explanations
+//    rewritten from the published paths (password resets alone don't beat MFA).
+//    Directory Synchronization Accounts no longer plants app credentials (no longer
+//    Tier-0 upstream). Engine edges moved into the KB as fields (plantsCredentials,
+//    selfEscalates, writesOpenGroups): Policy.ReadWrite.PermissionGrant and
+//    PrivilegedAssignmentSchedule.ReadWrite.EntraAppRole now self-escalate like
+//    AppRoleAssignment.ReadWrite.All. Kept stricter than upstream on purpose:
+//    User-PasswordProfile.ReadWrite.All and UserAuthMethod-QR.ReadWrite.All (left
+//    Tier-0 upstream) and Application/Cloud Application/Hybrid Identity/Intune
+//    Administrator (Indirect upstream, Direct here) pending maintainer review.
+//    Same day, after review: Application, Cloud Application, Hybrid Identity and
+//    Intune Administrator lowered to conditional to match azure-tiering (tenant
+//    mode still confirms the app-credential chain from the export).
+//    User-PasswordProfile.ReadWrite.All and UserAuthMethod-QR.ReadWrite.All moved
+//    to tier 2 conditional; QR was direct.
 
 // Microsoft's first-party app-owner tenant. Credentials on Microsoft-owned service
 // principals skip the generic vendor rule and get their own high-severity flag
@@ -813,10 +861,11 @@ const PERMISSIONS = [
     id: "Policy.ReadWrite.ConditionalAccess", guid: "01c0a623-fc9b-48e9-b794-0756f8e8f067",
     label: "Read and write Conditional Access policies", api: "Graph",
     escalation: "direct", tier: 1,
-    plain: "Can rewrite the sign-in rules that protect everyone (turn off MFA, carve out exceptions), opening the door to account takeover tenant-wide.",
+    impact: "availability",
+    plain: "Can rewrite the sign-in rules for everyone. One policy blocking all users, break-glass accounts included, locks the whole organisation out until someone pays. It can also strip MFA requirements to make other attacks easier.",
     canRead: ["policy"], canWrite: ["policy"],
-    escalationNote: "Disables or excludes MFA/CA enforcement, enabling takeover of admin accounts.",
-    tags: ["policy","conditional-access"],
+    escalationNote: "Creates a Conditional Access policy that blocks every user from every app, break-glass included, and holds the tenant to ransom. Global-Admin-level impact on availability (azure-tiering: Direct), not a way to become Global Admin.",
+    tags: ["policy","conditional-access","availability"],
   },
   {
     id: "PrivilegedAccess.ReadWrite.AzureADGroup", guid: "2f6817f8-7b12-4f0f-bc18-eeaf60705a9e",
@@ -840,19 +889,68 @@ const PERMISSIONS = [
     id: "User.EnableDisableAccount.All", guid: "3011c876-62b7-4ada-afa2-506cbbecc68c",
     label: "Enable and disable user accounts", api: "Graph",
     escalation: "direct", tier: 1,
-    plain: "Can disable accounts, including break-glass and admin accounts, as part of a takeover or to lock defenders out.",
+    impact: "availability",
+    plain: "Can disable every account in the organisation, break-glass and admins included, and lock everyone out.",
     canRead: ["users"], canWrite: ["users"],
-    escalationNote: "Classified Direct by azure-tiering as a tenant-impact primitive (disabling admins / break-glass).",
-    tags: ["user-write"],
+    escalationNote: "Disables all accounts and holds the tenant to ransom (azure-tiering: Direct, Global-Admin-level impact on availability). Needs User.Read.All or similar to enumerate users. In a PIM-enabled tenant it cannot disable the last Privileged Role Administrator.",
+    tags: ["user-write","availability"],
   },
   {
     id: "User.DeleteRestore.All", guid: "eccc023d-eccf-4e7b-9683-8813ab36cecc",
     label: "Delete and restore users", api: "Graph",
     escalation: "direct", tier: 1,
-    plain: "Can delete and restore user accounts. Restoring a deleted privileged account, or recreating one, is an escalation and persistence primitive.",
+    impact: "availability",
+    plain: "Can delete every account in the organisation, permanently if it chooses, break-glass and admins included.",
     canRead: ["users"], canWrite: ["users"],
-    escalationNote: "Classified Direct by azure-tiering; delete/restore of privileged users enables takeover and persistence.",
-    tags: ["user-write"],
+    escalationNote: "Deletes all accounts and holds the tenant to ransom (azure-tiering: Direct, Global-Admin-level impact on availability). In a PIM-enabled tenant it cannot delete the last Privileged Role Administrator.",
+    tags: ["user-write","availability"],
+  },
+  {
+    id: "UserAuthMethod-TAP.ReadWrite.All", guid: "627169a8-8c15-451c-861a-5b80e383de5c",
+    label: "Read and write all users' Temporary Access Pass methods", api: "Graph",
+    escalation: "direct", tier: 1,
+    plain: "Can issue a Temporary Access Pass for any account, Global Admins and break-glass included, and sign in as that account.",
+    canRead: ["auth-methods"], canWrite: ["auth-methods"],
+    escalationNote: "Creates a Temporary Access Pass on a Global Admin and signs in with it (same path as UserAuthenticationMethod.ReadWrite.All). If TAP is disabled in the tenant, it needs Policy.ReadWrite.AuthenticationMethod to turn it on.",
+    tags: ["auth-methods"],
+  },
+  {
+    id: "UserAuthMethod-Phone.ReadWrite.All", guid: "6e85d483-7092-4375-babe-0a94a8213a58",
+    label: "Read and write all users' phone methods", api: "Graph",
+    escalation: "direct", tier: 1,
+    plain: "Can put an attacker's phone number on any account and sign in with a text-message code.",
+    canRead: ["auth-methods"], canWrite: ["auth-methods"],
+    escalationNote: "Adds a controlled number to a Global Admin, enables it for SMS sign-in and signs in with the code. If SMS sign-in is disabled, it needs Policy.ReadWrite.AuthenticationMethod to turn it on.",
+    tags: ["auth-methods"],
+  },
+  {
+    id: "UserAuthMethod-QR.ReadWrite.All", guid: "4869299f-18c3-40c8-98f2-222657e67db1",
+    label: "Read and write all users' QR code methods", api: "Graph",
+    escalation: "conditional", tier: 2,
+    plain: "Can create a QR code and PIN sign-in for accounts where that method is enabled (typically frontline workers).",
+    canRead: ["auth-methods"], canWrite: ["auth-methods"],
+    escalationNote: "Creates a QR code + PIN for an account in scope of the method and signs in as it. No longer in azure-tiering's Tier-0, so no published path to Global Admin.",
+    conditionalOn: "QR code sign-in enabled for an account that controls privilege.",
+    tags: ["auth-methods"],
+  },
+  {
+    id: "UserAuthMethod-HardwareOATH.ReadWrite.All", guid: "7e9ebcc1-90aa-4471-8051-e68d6b4e9c89",
+    label: "Read and write all users' hardware OATH token methods", api: "Graph",
+    escalation: "conditional", tier: 1,
+    plain: "Can attach an attacker-controlled one-time-code token to non-admin accounts and use it to reset their password through self-service reset. Dangerous when such an account owns a privileged app.",
+    canRead: ["auth-methods"], canWrite: ["auth-methods"],
+    escalationNote: "Activates a token with a known secret on a non-admin who owns a privileged app, resets their password via SSPR with it, signs in, then acts as the app. Admin accounts are protected by the two-gate SSPR policy.",
+    conditionalOn: "A non-admin owner of a privileged app; hardware OATH enabled and accepted by SSPR; a token with a known secret (or Policy.ReadWrite.AuthenticationMethod to create one).",
+    tags: ["auth-methods"],
+  },
+  {
+    id: "DelegatedAdminRelationship.ReadWrite.All", guid: "cc13eba4-8cd8-44c6-b4d4-f93237adce58",
+    label: "Manage delegated admin (GDAP) relationships with customers", api: "Graph",
+    escalation: "direct", tier: 1,
+    plain: "In a partner (CSP/MSP) tenant: can add people to the groups that GDAP relationships trust, which makes them admins, often Global Admin, in customer tenants.",
+    canRead: ["groups","roles"], canWrite: ["groups","roles"],
+    escalationNote: "Adds a controlled user to a security group already approved in a GDAP relationship and assumes the roles it grants in customer tenants, typically Global Admin. The takeover lands in the customers' tenants, not this one.",
+    tags: ["gdap","cross-tenant"],
   },
 
   // ===== TIER 0: CONDITIONAL / INDIRECT (azure-tiering "Indirect") =====
@@ -860,16 +958,17 @@ const PERMISSIONS = [
     id: "AppRoleAssignment.ReadWrite.All", guid: "06b708a9-e830-4db3-a914-8e69da51d44f",
     label: "Manage app permission grants and app role assignments", api: "Graph",
     escalation: "conditional", tier: 1,
+    selfEscalates: true,
     plain: "Can grant applications more permissions, including granting itself the one that leads straight to Global Admin. One hop from takeover.",
     canRead: ["directory"], canWrite: ["app-permissions"],
-    escalationNote: "Grants itself RoleManagement.ReadWrite.Directory, then promotes to Global Admin (the SkyKick-class move). Only 'indirect' because of that one extra grant.",
-    conditionalOn: "Nothing beyond the Graph service principal. The extra grant is always available, which is why many treat this as effectively direct.",
+    escalationNote: "Grants itself RoleManagement.ReadWrite.Directory, then promotes to Global Admin (the SkyKick-class move). azure-tiering rates it Indirect because of that one extra grant; this tool treats it as direct because the grant needs nothing else in the tenant.",
     tags: ["app-permissions","consent"],
   },
   {
     id: "Application.ReadWrite.All", guid: "1bfefb4e-e0b5-418b-a88f-73c46d2cc8e9",
     label: "Read and write all applications", api: "Graph",
     escalation: "conditional", tier: 1,
+    plantsCredentials: "any",
     plain: "Can add a secret or certificate to ANY app in the tenant and then act as that app. Its real power equals the single most privileged app it can hijack.",
     canRead: ["directory","apps"], canWrite: ["apps","app-credentials"],
     escalationNote: "Plants credentials on a higher-privileged app (or one holding a directory role) and inherits its access. This is the persistence move from the SkyKick incident.",
@@ -877,9 +976,21 @@ const PERMISSIONS = [
     tags: ["app-credentials","persistence"],
   },
   {
+    id: "Application.ReadUpdate.All", guid: "fc023787-fd04-4e44-9bc7-d454f00c0f0a",
+    label: "Read and update all applications", api: "Graph",
+    escalation: "conditional", tier: 1,
+    plantsCredentials: "any",
+    plain: "Can modify any app in the tenant, including adding credentials, and then act as it. Same reach as Application.ReadWrite.All.",
+    canRead: ["directory","apps"], canWrite: ["apps","app-credentials"],
+    escalationNote: "Same path as Application.ReadWrite.All: plants a credential on a more privileged app and inherits its access.",
+    conditionalOn: "Whether any app in the tenant holds RoleManagement.ReadWrite.Directory, a privileged directory role, or similar.",
+    tags: ["app-credentials","persistence"],
+  },
+  {
     id: "Application.ReadWrite.OwnedBy", guid: "18a4783c-866b-4cc7-a460-3d5e5662c884",
     label: "Manage apps that this app creates or owns", api: "Graph",
     escalation: "conditional", tier: 1,
+    plantsCredentials: "owned",
     plain: "Can add credentials to apps it owns. Dangerous if it owns, or can make itself owner of, a privileged app.",
     canRead: ["apps"], canWrite: ["app-credentials"],
     escalationNote: "If it owns a privileged app, it mints a credential and inherits that app's access.",
@@ -890,6 +1001,7 @@ const PERMISSIONS = [
     id: "Directory.ReadWrite.All", guid: "19dbc75e-c2e2-444c-a770-ec69d8559fc7",
     label: "Read and write directory data", api: "Graph",
     escalation: "conditional", tier: 1,
+    writesOpenGroups: true,
     plain: "Broad write over users, groups and directory objects. Microsoft's docs call it 'broadly equivalent to Global Admin,' but on its own it canNOT assign directory roles. The real danger is editing privileged groups or non-admin accounts.",
     canRead: ["directory","users","groups"], canWrite: ["directory","users","groups"],
     escalationNote: "No direct role assignment; reaches privilege by editing role-assignable groups or manipulating objects. Often overstated, but still Tier-0 where such groups exist.",
@@ -900,6 +1012,7 @@ const PERMISSIONS = [
     id: "Group.ReadWrite.All", guid: "62a82d76-70ea-41e2-9197-370581804d09",
     label: "Read and write all groups", api: "Graph",
     escalation: "conditional", tier: 1,
+    writesOpenGroups: true,
     plain: "Can change group membership across the tenant. As bad as whatever the most powerful group controls: app roles, licensing, SharePoint/Teams access, or (if role-assignable) a directory role.",
     canRead: ["groups","directory"], canWrite: ["groups"],
     escalationNote: "Adds itself or a principal to a role-assignable group, or a group that gates app/data access.",
@@ -910,6 +1023,7 @@ const PERMISSIONS = [
     id: "GroupMember.ReadWrite.All", guid: "dbaae8cf-10b5-4b86-a4a1-f871c94c6695",
     label: "Read and write all group memberships", api: "Graph",
     escalation: "conditional", tier: 1,
+    writesOpenGroups: true,
     plain: "Can add or remove members from any group. Same risk as Group write if a role-assignable or access-granting group exists.",
     canRead: ["groups"], canWrite: ["groups"],
     escalationNote: "Adds a principal to a role-assignable group to inherit its roles.",
@@ -929,11 +1043,11 @@ const PERMISSIONS = [
   {
     id: "User-PasswordProfile.ReadWrite.All", guid: "cc117bb9-00cf-4eb8-b580-ea2a878fe8f7",
     label: "Read and write all users' password profiles", api: "Graph",
-    escalation: "conditional", tier: 1,
-    plain: "Can reset passwords for users across the tenant. If a resettable account controls a privileged app or group, that's an escalation path.",
+    escalation: "conditional", tier: 2,
+    plain: "Can reset passwords across the tenant. A reset alone doesn't get past MFA, so it matters where an account that controls privilege has no working MFA.",
     canRead: ["users"], canWrite: ["users","auth-methods"],
-    escalationNote: "Resets the password of a user who owns a privileged app or holds a useful role.",
-    conditionalOn: "Whether a resettable user controls privilege (app owner, group owner, admin without MFA).",
+    escalationNote: "Resets the password of an account without working MFA that owns a privileged app or group. No longer in azure-tiering's Tier-0.",
+    conditionalOn: "An account without working MFA that controls privilege (app or group owner).",
     tags: ["user-write","auth-methods"],
   },
   {
@@ -990,9 +1104,10 @@ const PERMISSIONS = [
     id: "Policy.ReadWrite.PermissionGrant", guid: "a402ca1c-2696-4531-972d-6e5ee4aa11ea",
     label: "Read and write consent / permission-grant policy", api: "Graph",
     escalation: "conditional", tier: 1,
+    selfEscalates: true,
     plain: "Can change the rules governing app consent, e.g. re-enabling risky user consent so a malicious app can be granted broad access.",
     canRead: ["policy"], canWrite: ["policy","app-permissions"],
-    escalationNote: "Relaxes consent policy to allow a malicious app to obtain high permissions.",
+    escalationNote: "Creates a permission grant policy that lets it grant itself RoleManagement.ReadWrite.Directory, then follows that permission to Global Admin. Needs nothing else in the tenant.",
     conditionalOn: "Follow-on consent to a malicious app.",
     tags: ["policy","consent"],
   },
@@ -1054,7 +1169,262 @@ const PERMISSIONS = [
     canRead: ["devices"], canWrite: ["devices","roles"],
     escalationNote: "Self-grants Intune role, then abuses device management for code execution.",
     conditionalOn: "Managed devices used by privileged users.",
+  },
+  {
+    id: "DeviceManagementScripts.ReadWrite.All", guid: "9255e99d-faf5-445e-bbf7-cb71482737c4",
+    label: "Read and write Intune device scripts", api: "Graph",
+    escalation: "conditional", tier: 1,
+    plain: "Can push PowerShell, shell and remediation scripts to managed devices. That is code execution on users' machines, admins' included.",
+    canRead: ["devices"], canWrite: ["devices"],
+    escalationNote: "Same path as DeviceManagementConfiguration.ReadWrite.All: runs a script on a Global Admin's managed device and steals their tokens.",
+    conditionalOn: "Presence of managed devices used by privileged users.",
     tags: ["intune","code-exec"],
+  },
+  {
+    id: "SignInIdentifier.ReadWrite.All", guid: "7fc588a2-ea2d-4d1f-bcf7-33c324b149b8",
+    label: "Read and write sign-in identifiers", api: "Graph",
+    escalation: "direct", tier: 1,
+    impact: "availability",
+    plain: "Can switch off every sign-in identifier in the tenant (UPN, email, username), so no one, break-glass included, can sign in. It can also change UPNs to move an account into a UPN-based dynamic group.",
+    canRead: ["users"], canWrite: ["users"],
+    escalationNote: "Disables every sign-in identifier and deletes the custom ones, locking out every account, and holds the tenant to ransom (azure-tiering: Direct, Global-Admin-level impact on availability). Separately, can edit a UPN to join a dynamic group with privileged Azure access.",
+        tags: ["user-write","availability"],
+  },
+  {
+    id: "Group-OnPremisesSyncBehavior.ReadWrite.All", guid: "2d9bd318-b883-40be-9df7-63ec4fcdc424",
+    label: "Read and update the on-premises sync behaviour of groups", api: "Graph",
+    escalation: "conditional", tier: 1,
+    plain: "Can switch a cloud group to being managed from on-premises Active Directory, or the reverse. Combined with control of on-premises AD, that hands over membership of privileged cloud groups.",
+    canRead: ["groups"], canWrite: ["groups"],
+    escalationNote: "With on-premises Domain Admin-level access, converts a cloud group that grants Global Admin into a synced group and adds a controlled account on-premises.",
+    conditionalOn: "Attacker control of the connected on-premises Active Directory.",
+    tags: ["hybrid","group-write"],
+  },
+  {
+    id: "SecurityIdentitiesActions.ReadWrite.All", guid: "af2bf46f-7bf1-4be3-8bad-e17e279e8462",
+    label: "Read and perform identity security actions", api: "Graph",
+    escalation: "conditional", tier: 1,
+    impact: "availability",
+    plain: "Can mark accounts as compromised or disable them through identity-protection actions, which can lock the organisation out.",
+    canRead: ["users"], canWrite: ["users"],
+    escalationNote: "Marks every account as compromised so Conditional Access blocks sign-in, or disables accounts outright where PIM isn't used, and holds the tenant to ransom. A lockout, not a way to become Global Admin.",
+    conditionalOn: "Risk-based Conditional Access policies, or a tenant without PIM.",
+    tags: ["availability"],
+  },
+  {
+    id: "Synchronization.ReadWrite.All", guid: "9b50c33d-700f-43b1-b2eb-87e89b703581",
+    label: "Read and write Entra synchronization configuration", api: "Graph",
+    escalation: "conditional", tier: 1,
+    plain: "Can reconfigure the directory synchronization service. No public escalation path yet, but it touches identity plumbing, so treat it as Tier 0.",
+    canRead: ["directory"], canWrite: ["directory"],
+    escalationNote: "Untested research gap: azure-tiering keeps it in Tier 0 for safety. It does not appear able to create app credentials.",
+    conditionalOn: "Research still open; how sync is used in the tenant.",
+    tags: ["hybrid"],
+  },
+  {
+    id: "PrivilegedAccess.ReadWrite.AzureAD", guid: "854d9ab1-6657-4ec8-be45-823027bcd009",
+    label: "Legacy PIM: manage Entra role assignments", api: "Graph",
+    escalation: "conditional", tier: 1,
+    plain: "Legacy Privileged Identity Management permission. Not known to work as an application permission, but it governed admin-role assignment, so any grant deserves a look.",
+    canRead: ["roles"], canWrite: ["roles"],
+    escalationNote: "Legacy; azure-tiering keeps it in Tier 0 until Microsoft removes it.",
+    conditionalOn: "Whether the legacy PIM API still honours it.",
+    tags: ["pim","legacy"],
+  },
+  {
+    id: "PrivilegedAccess.ReadWrite.AzureResources", guid: "6f9d5abc-2db6-400b-a267-7de22a40fb87",
+    label: "Legacy PIM: manage Azure resource role assignments", api: "Graph",
+    escalation: "conditional", tier: 1,
+    plain: "Legacy Privileged Identity Management permission for Azure resource roles. Not known to work as an application permission.",
+    canRead: ["roles"], canWrite: ["roles"],
+    escalationNote: "Legacy; azure-tiering keeps it in Tier 0 until Microsoft removes it.",
+    conditionalOn: "Whether the legacy PIM API still honours it.",
+    tags: ["pim","legacy"],
+    tags: ["intune","code-exec"],
+  },
+
+  {
+    id: "PrivilegedAssignmentSchedule.ReadWrite.EntraAppRole", guid: "81adad77-a25a-489d-ac43-321115620139",
+    label: "Schedule PIM assignments of app roles", api: "Graph",
+    escalation: "conditional", tier: 1,
+    selfEscalates: true,
+    plain: "Can give itself Microsoft Graph application permissions through PIM, including the one that hands out Global Admin.",
+    canRead: ["app-permissions"], canWrite: ["app-permissions"],
+    escalationNote: "Creates a time-bound PIM assignment of RoleManagement.ReadWrite.Directory to itself, then assigns Global Admin. Needs nothing else in the tenant.",
+    tags: ["pim", "app-permissions"],
+  },
+  {
+    id: "PrivilegedEligibilitySchedule.ReadWrite.EntraAppRole", guid: "7f4c39f1-1aa7-44b7-ab05-38df2609c37a",
+    label: "Schedule PIM eligibility for app roles", api: "Graph",
+    escalation: "conditional", tier: 1,
+    plain: "Can make an app eligible for Microsoft Graph application permissions through PIM, including the one that hands out Global Admin, then activate it.",
+    canRead: ["app-permissions"], canWrite: ["app-permissions"],
+    escalationNote: "Makes a controlled service principal eligible for RoleManagement.ReadWrite.Directory and activates it.",
+    conditionalOn: "PIM activation settings for app roles (approval requirements).",
+    tags: ["pim", "app-permissions"],
+  },
+  {
+    id: "RoleManagementPolicy.ReadWrite.EntraAppRole", guid: "ec563bdb-80dc-47c0-81d3-bff47cc6ac06",
+    label: "Manage PIM policies for app roles", api: "Graph",
+    escalation: "conditional", tier: 1,
+    plain: "Can remove approval and other requirements from PIM-managed app-role assignments, clearing the way for the two permissions above.",
+    canRead: ["app-permissions"], canWrite: ["app-permissions", "policy"],
+    escalationNote: "Strips assignment and activation constraints so PrivilegedAssignmentSchedule/EligibilitySchedule.ReadWrite.EntraAppRole can be used in a tenant with strict PIM settings.",
+    conditionalOn: "A paired app-role assignment or eligibility primitive.",
+    tags: ["pim", "app-permissions"],
+  },
+  {
+    id: "RoleManagement-Authorization.ReadWrite.All", guid: "7c4d6288-8d2f-40e0-82ce-efa72265e9fb",
+    label: "Manage unified role definitions and assignments", api: "Graph",
+    escalation: "conditional", tier: 1,
+    plain: "Can create role definitions and assign roles, including custom Entra roles that can update app credentials, or Intune roles.",
+    canRead: ["roles"], canWrite: ["roles"],
+    escalationNote: "Assigns a privileged built-in or custom Entra role (e.g. one with application-credential update) or an Intune role to a controlled principal.",
+    conditionalOn: "Which roles it can assign and what they reach (a credential-capable custom role is enough).",
+    tags: ["roles"],
+  },
+  {
+    id: "PrivilegedAccess-CustomExt.ReadWrite.All", guid: "124325f3-0c46-4c57-a050-d6d1a82510f6",
+    label: "Manage PIM custom extensions", api: "Graph",
+    escalation: "conditional", tier: 1,
+    plain: "Can disable or redirect the custom check that PIM runs before approving a privileged role activation.",
+    canRead: ["roles", "policy"], canWrite: ["policy"],
+    escalationNote: "Removes a PIM custom-extension pre-approval check, so a principal whose session the attacker controls can activate Global Admin unchecked.",
+    conditionalOn: "Global Admin activation gated by a PIM custom extension, and control of an eligible principal's session.",
+    tags: ["pim", "policy"],
+  },
+  {
+    id: "AgentIdentityBlueprint.AddRemoveCreds.All", guid: "0510736e-bdfb-4b37-9a1f-89b4a074763a",
+    label: "Add and remove credentials on agent identity blueprints", api: "Graph",
+    escalation: "conditional", tier: 1,
+    plain: "Can add credentials to agent identity blueprints and act as the AI agents built from them. As dangerous as the most privileged agent.",
+    canRead: ["apps"], canWrite: ["app-credentials"],
+    escalationNote: "Adds a credential to the blueprint behind an agent identity that holds privileged Graph permissions, then acts as that agent.",
+    conditionalOn: "Whether any agent identity holds privileged Microsoft Graph permissions.",
+    tags: ["agents", "app-credentials"],
+  },
+  {
+    id: "AgentIdentityBlueprint.ReadWrite.All", guid: "7fddd33b-d884-4ec0-8696-72cff90ff825",
+    label: "Read and write agent identity blueprints", api: "Graph",
+    escalation: "conditional", tier: 1,
+    plain: "Can manage agent identity blueprints, including their credentials, and act as the AI agents built from them.",
+    canRead: ["apps"], canWrite: ["apps", "app-credentials"],
+    escalationNote: "Same as Agent ID Administrator: impersonates an agent identity with privileged Graph permissions.",
+    conditionalOn: "Whether any agent identity holds privileged Microsoft Graph permissions.",
+    tags: ["agents", "app-credentials"],
+  },
+  {
+    id: "AgentIdUser.ReadWrite.All", guid: "b782c9ad-6f2b-4894-a21b-72bf22417f0a",
+    label: "Read and write agent user accounts", api: "Graph",
+    escalation: "conditional", tier: 1,
+    plain: "Can create or edit the user accounts AI agents use, including properties that drive dynamic group membership.",
+    canRead: ["users"], canWrite: ["users"],
+    escalationNote: "With control of an agent identity, sets its agent user's attributes (Department, Employee ID) to join a dynamic group with privileged Azure access, then escalates through Azure.",
+    conditionalOn: "Control of an agent identity, and a dynamic group granting privileged Azure access.",
+    tags: ["agents", "user-write"],
+  },
+  {
+    id: "AgentIdUser.ReadWrite.IdentityParentedBy", guid: "4aa6e624-eee0-40ab-bdd8-f9639038a614",
+    label: "Read and write agent users of its own agents", api: "Graph",
+    escalation: "conditional", tier: 1,
+    plain: "Can edit the user accounts of AI agents it owns, including properties that drive dynamic group membership.",
+    canRead: ["users"], canWrite: ["users"],
+    escalationNote: "Edits attributes of an agent user parented by one of its own agent identities to join a dynamic group with privileged Azure access, then impersonates that user.",
+    conditionalOn: "A dynamic group granting privileged Azure access.",
+    tags: ["agents", "user-write"],
+  },
+  {
+    id: "AdministrativeUnitMember.ReadWrite.All", guid: "9205f977-63a7-4c23-9d0c-8051235b0e4c",
+    label: "Manage administrative unit membership", api: "Graph",
+    escalation: "conditional", tier: 1,
+    plain: "Can move accounts in and out of administrative units, including restricted ones that protect Global Admins and break-glass accounts.",
+    canRead: ["directory"], canWrite: ["directory"],
+    escalationNote: "Removes a Global Admin from a restricted management administrative unit so a TAP-issuing permission can take it over.",
+    conditionalOn: "Another permission that can issue a Temporary Access Pass (e.g. UserAuthMethod-TAP.ReadWrite.All).",
+    tags: ["admin-units"],
+  },
+  {
+    id: "User.Create", guid: "4240f680-4f73-4082-a766-aa916a2dc9b3",
+    label: "Create users", api: "Graph",
+    escalation: "conditional", tier: 1,
+    plain: "Can create accounts with a chosen password and attributes, including ones that land in dynamic groups with privileged access.",
+    canRead: ["users"], canWrite: ["users"],
+    escalationNote: "Creates a user whose attributes match a dynamic group with privileged Azure access, registers its own MFA at first sign-in, then escalates through Azure.",
+    conditionalOn: "A dynamic group granting privileged Azure access, and no Conditional Access restriction on security-info registration.",
+    tags: ["user-write"],
+  },
+  {
+    id: "User.ReadUpdate.All", guid: "5639c449-cfd9-4088-bc48-3e16da108bf8",
+    label: "Read and update user profiles", api: "Graph",
+    escalation: "conditional", tier: 1,
+    plain: "Can edit organisational attributes of any user (department, employee ID, job title), which can change dynamic group membership.",
+    canRead: ["users"], canWrite: ["users"],
+    escalationNote: "Edits a controlled account's attributes to join a dynamic group with privileged Azure access, then escalates through Azure. Cannot change passwords or auth methods.",
+    conditionalOn: "A dynamic group granting privileged Azure access.",
+    tags: ["user-write"],
+  },
+  {
+    id: "UserCertificateIds.ReadWrite.All", guid: "10d0f892-6ef8-4cd8-9f4c-614345762e90",
+    label: "Read and write users' certificate user IDs", api: "Graph",
+    escalation: "conditional", tier: 1,
+    plain: "Can change which certificate signs in as which account. With certificate-based sign-in, an attacker's certificate can be mapped to a Global Admin.",
+    canRead: ["auth-methods"], canWrite: ["auth-methods"],
+    escalationNote: "Maps a certificate the attacker holds (issued by a CA Entra trusts) to a Global Admin's certificateUserIds and signs in as them.",
+    conditionalOn: "Certificate-based authentication enabled for the target and counted as multifactor, and a certificate from a trusted CA.",
+    tags: ["auth-methods"],
+  },
+  {
+    id: "Policy.ReadWrite.Recovery", guid: "795fc94d-3deb-4632-b1eb-e6d1a5f44918",
+    label: "Read and write the account recovery policy", api: "Graph",
+    escalation: "conditional", tier: 1,
+    plain: "Can change how accounts are recovered, making Global Admins recoverable through a verification flow the attacker can pass.",
+    canRead: ["policy"], canWrite: ["policy", "auth-methods"],
+    escalationNote: "Makes Global Admin accounts recoverable through an identity-verification flow the attacker satisfies, recovers one, registers new methods and signs in.",
+    conditionalOn: "An identity-verification flow the attacker can satisfy.",
+    tags: ["policy", "auth-methods"],
+  },
+  {
+    id: "ContentHub-Installed.ReadWrite.All", guid: "0c6404f6-8e7a-413b-adc0-e9b750d959c8",
+    label: "Manage installed Content Hub packages", api: "Graph",
+    escalation: "conditional", tier: 1,
+    plain: "Can change installed security content packages, including playbooks that run as a managed identity.",
+    canRead: ["apps"], canWrite: ["apps"],
+    escalationNote: "Modifies a playbook that runs as a privileged managed identity and acts as that identity.",
+    conditionalOn: "Content Hub playbooks running as a privileged managed identity.",
+    tags: ["code-exec"],
+  },
+  {
+    id: "UserAuthenticationMethod.Delete.All", guid: "712f5e0d-bc8d-4ae5-8242-cfb9a4921ed3",
+    label: "Delete all users' authentication methods", api: "Graph",
+    escalation: "conditional", tier: 1,
+    impact: "availability",
+    plain: "Can delete every admin's sign-in methods. Where MFA is enforced and security-info registration is locked down, that locks admins out.",
+    canRead: ["auth-methods"], canWrite: ["auth-methods"],
+    escalationNote: "Deletes the MFA methods of every admin and break-glass account and holds the tenant to ransom (Global-Admin-level impact on availability). With a stolen Global Admin password, can also swap their MFA for its own.",
+    conditionalOn: "A read permission to list method IDs; MFA enforced for admins with registration protected by Conditional Access.",
+    tags: ["auth-methods", "availability"],
+  },
+  {
+    id: "UserAuthMethod-Passkey.Delete.All", guid: "9563fbd0-03a7-466e-8042-63d668b7d1a3",
+    label: "Delete all users' passkeys", api: "Graph",
+    escalation: "conditional", tier: 1,
+    impact: "availability",
+    plain: "Can delete every admin's passkeys. Where break-glass and admins rely on passkeys, that locks them out.",
+    canRead: ["auth-methods"], canWrite: ["auth-methods"],
+    escalationNote: "Deletes the passkeys of break-glass accounts and admins in a tenant enforcing phishing-resistant MFA and holds it to ransom. With a stolen Global Admin password, can swap their passkey for its own.",
+    conditionalOn: "A permission to read passkey IDs; passkey-only break-glass or admin accounts.",
+    tags: ["auth-methods", "availability"],
+  },
+  {
+    id: "UserAuthMethod-Passkey.ReadWrite.All", guid: "0400e371-7db1-4338-a269-96069eb65227",
+    label: "Read and write all users' passkeys", api: "Graph",
+    escalation: "conditional", tier: 1,
+    impact: "availability",
+    plain: "Can list and delete every admin's passkeys. Where break-glass and admins rely on passkeys, that locks them out.",
+    canRead: ["auth-methods"], canWrite: ["auth-methods"],
+    escalationNote: "Lists and deletes the passkeys of break-glass accounts and admins in a tenant enforcing phishing-resistant MFA and holds it to ransom. With a stolen Global Admin password, can swap their passkey for its own.",
+    conditionalOn: "Passkey-only break-glass or admin accounts.",
+    tags: ["auth-methods", "availability"],
   },
 
   // ===== TIER 2: broad data / sensitive, no known direct escalation =====
@@ -1241,58 +1611,162 @@ const PERMISSIONS = [
 
 // ---- DIRECTORY ROLES (assigned to the service principal) -------------------
 const ROLES = [
-  { id: "Global Administrator", escalation: "direct", tier: 1,
+  { id: "Global Administrator", templateId: "62e90394-69f5-4237-9190-012177145e10", escalation: "direct", tier: 1,
     plain: "Unlimited control of the entire tenant. There is nothing it can't do.",
     escalationNote: "Already Global Admin." },
-  { id: "Privileged Role Administrator", escalation: "direct", tier: 1,
+  { id: "Privileged Role Administrator", templateId: "e8611ab8-c189-46e8-94e1-60213ab1f814", escalation: "direct", tier: 1,
     plain: "Can assign any role to anyone, including Global Admin. Effectively equal to Global Admin.",
     escalationNote: "Assigns itself Global Administrator." },
-  { id: "Privileged Authentication Administrator", escalation: "direct", tier: 1,
+  { id: "Privileged Authentication Administrator", templateId: "7be44c8a-adaf-4e2a-84d6-ab2649e08a13", escalation: "direct", tier: 1,
     plain: "Can reset authentication methods for ANY user including Global Admins, then sign in as them.",
     escalationNote: "Resets a Global Admin's auth methods and takes the account." },
-  { id: "Application Administrator", escalation: "direct", tier: 1,
-    plain: "Can add credentials to any app and act as it. Because Graph's own apps carry escalation permissions, this reaches Global Admin.",
-    escalationNote: "Plants a credential on an app holding RoleManagement.ReadWrite.Directory (or similar) and inherits it." },
-  { id: "Cloud Application Administrator", escalation: "direct", tier: 1,
-    plain: "Like Application Administrator (minus on-prem proxy). Can add app credentials and escalate.",
-    escalationNote: "Same app-credential path to a privileged app." },
-  { id: "Hybrid Identity Administrator", escalation: "direct", tier: 1,
-    plain: "Controls federation/sync config. Can establish trust that forges tokens for any user.",
-    escalationNote: "Configures malicious federation to impersonate admins." },
-  { id: "Intune Administrator", escalation: "direct", tier: 1,
-    plain: "Can push scripts and configuration to all managed devices. That means code execution on endpoints, including admins' machines.",
-    escalationNote: "Deploys a script to a Global Admin's managed device to steal tokens/credentials." },
-  { id: "Partner Tier2 Support", escalation: "direct", tier: 1,
-    plain: "Legacy high-privilege support role that can modify Global Admins. Rarely needed, dangerous if present.",
-    escalationNote: "Can reset/modify Global Admin accounts." },
-  { id: "Security Administrator", escalation: "conditional", tier: 1,
-    plain: "Broad security control. Can change security policy, including some Conditional Access, weakening defenses.",
-    escalationNote: "Weakens CA/security policy to enable account takeover.",
-    conditionalOn: "Follow-on takeover once defenses are lowered." },
-  { id: "User Administrator", escalation: "conditional", tier: 2,
-    plain: "Can reset passwords for non-admins and manage users and groups. A path to escalation if a resettable account holds app-admin rights.",
-    escalationNote: "Resets a user who owns a privileged app, then uses that app.",
-    conditionalOn: "Whether a resettable non-admin controls a privileged app or group." },
-  { id: "Exchange Administrator", escalation: "conditional", tier: 2,
-    plain: "Full control of Exchange Online: all mailboxes, transport rules, mail flow.",
-    escalationNote: "Total control of email, which is leverage for fraud and reset-based takeover, but not a directory takeover by itself.",
-    conditionalOn: "What email access enables (password resets via mail, BEC)." },
-  { id: "SharePoint Administrator", escalation: "conditional", tier: 2,
-    plain: "Full control of SharePoint and OneDrive content across the tenant.",
-    escalationNote: "Mass access to documents; can be chained with file-based credential theft.",
-    conditionalOn: "What sensitive material or secrets live in SharePoint." },
-  { id: "Groups Administrator", escalation: "conditional", tier: 2,
-    plain: "Manages all groups. As dangerous as what the tenant's role-assignable groups grant.",
-    escalationNote: "Adds a principal to a role-assignable group.",
-    conditionalOn: "Role-assignable group configuration." },
-  { id: "Helpdesk Administrator", escalation: "conditional", tier: 2,
-    plain: "Can reset non-admin passwords. Escalation path if a resettable account controls privilege.",
-    escalationNote: "Resets a user who owns a privileged app or group.",
-    conditionalOn: "Whether a resettable account controls privilege." },
-  { id: "Directory Readers", escalation: "none", tier: 3,
+    { id: "Application Administrator", templateId: "9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3", escalation: "conditional", tier: 1,
+    plantsCredentials: "any",
+    plain: "Can add credentials to any app and act as it. As dangerous as the most privileged app in the tenant.",
+    escalationNote: "Plants a credential on an app holding privileged Graph permissions and inherits it.",
+    conditionalOn: "Whether a more privileged app exists to backdoor (tenant mode checks this)." },
+    { id: "Cloud Application Administrator", templateId: "158c047a-c907-4556-b7ef-446551a6b5f7", escalation: "conditional", tier: 1,
+    plantsCredentials: "any",
+    plain: "Like Application Administrator (minus on-premises app proxy). Can add app credentials and act as the app.",
+    escalationNote: "Same as Application Administrator: plants a credential on a more privileged app and inherits it.",
+    conditionalOn: "Whether a more privileged app exists to backdoor (tenant mode checks this)." },
+    { id: "Hybrid Identity Administrator", templateId: "8ac3fc64-6eca-42ea-9e69-59f4c7b60eb2", escalation: "conditional", tier: 1,
+    plantsCredentials: "any",
+    plain: "Controls federation and sync configuration, and can manage app credentials. Can establish trust that forges sign-ins for existing accounts.",
+    escalationNote: "Same as Domain Name Administrator (federated domain, sign in as a Global Admin) and Application Administrator (app-credential path).",
+    conditionalOn: "Federation configuration, or a more privileged app to backdoor (tenant mode checks the app path)." },
+  { id: "Intune Administrator", templateId: "3a2c62db-5318-420d-8d74-23affee5d9d5", escalation: "conditional", tier: 1,
+    writesOpenGroups: true,
+    plain: "Can push scripts and configuration to all managed devices, admins' machines included, and manage some groups.",
+    escalationNote: "Runs commands on a Global Admin's managed device and extracts their tokens; also the Directory Writers group path.",
+    conditionalOn: "Global Admins using Intune-managed devices, or groups granting privileged Azure access." },
+  { id: "Partner Tier2 Support", templateId: "e00e864a-17c5-4a4b-9c06-f5b95a8d5bd8", escalation: "direct", tier: 1,
+    plain: "Retired support role that can reset passwords for any account, Global Admins included. Microsoft has blocked new assignments since August 2026; any assignment left is legacy and should be removed.",
+    escalationNote: "Resets a Global Admin's password and takes the account." },
+  { id: "Domain Name Administrator", templateId: "8329153b-31d0-4727-b945-745eb3bc5f31", escalation: "conditional", tier: 1,
+    plain: "Can add, verify and federate domains. A federated domain the attacker controls lets them forge sign-ins for existing accounts, Global Admins included.",
+    escalationNote: "Same path as Domain.ReadWrite.All: adds a federated domain and signs in as an existing Global Admin without password or MFA.",
+    conditionalOn: "Tenant federation configuration and verification state." },
+    { id: "Directory Synchronization Accounts", templateId: "d29b2b05-8046-44ba-8758-1e26182fcf32", escalation: "conditional", tier: 1,
+    plain: "The Entra Connect sync identity. Protect it like the sync server.",
+    escalationNote: "No longer in azure-tiering's Tier-0 (it was listed as an app-credential path before Microsoft narrowed the role); kept conditional here because it is the sync identity.",
+    conditionalOn: "How the sync account and server are protected." },
+    { id: "Security Administrator", templateId: "194ae4cb-b126-40b2-bd5b-6091b380977d", escalation: "direct", tier: 1,
+    impact: "availability",
+    plain: "Broad security control, including Conditional Access and domain federation settings.",
+    escalationNote: "Same as Conditional Access Administrator (a policy blocking everyone, held to ransom: Global-Admin-level impact on availability) and Domain Name Administrator (federated domain, sign in as a Global Admin)." },
+    { id: "User Administrator", templateId: "fe930be7-5e62-47db-91af-98c3a49a38b1", escalation: "conditional", tier: 2,
+    writesOpenGroups: true,
+    plain: "Manages users and ordinary groups, and access-package policies. Password resets alone don't take over accounts, because MFA still applies.",
+    escalationNote: "Adds a controlled account to a non-role-assignable group with privileged Azure access (or edits a dynamic rule or attributes to match one), or opens an access package that grants Global Admin.",
+    conditionalOn: "Non-role-assignable groups with privileged Azure access, dynamic rules, or an access package granting Global Admin." },
+    { id: "Exchange Administrator", templateId: "29232cdf-9323-42fd-ade2-1d097af3e4de", escalation: "conditional", tier: 2,
+    writesOpenGroups: true,
+    plain: "Full control of Exchange Online (mailboxes, transport rules, mail flow) and of Microsoft 365 group membership.",
+    escalationNote: "Same as Directory Writers: joins a group with privileged Azure access. Separately, total control of email is leverage for fraud and reset-based takeover.",
+    conditionalOn: "What non-role-assignable groups grant (Azure RBAC, app roles, SSO access)." },
+    { id: "SharePoint Administrator", templateId: "f28a1f50-f6e7-4571-818b-6a12f2af6b6c", escalation: "conditional", tier: 2,
+    writesOpenGroups: true,
+    plain: "Full control of SharePoint and OneDrive content, and of Microsoft 365 group membership.",
+    escalationNote: "Same as Directory Writers: joins a non-role-assignable group with privileged Azure access and escalates through Azure resources. Also mass access to documents.",
+    conditionalOn: "What non-role-assignable groups grant (Azure RBAC, app roles, SSO access)." },
+    { id: "Groups Administrator", templateId: "fdd7a751-b60b-444a-984c-02652fe8fa1c", escalation: "conditional", tier: 2,
+    writesOpenGroups: true,
+    plain: "Manages groups, but not role-assignable groups, which Microsoft protects. As dangerous as what ordinary groups grant.",
+    escalationNote: "Same as Directory Writers: joins a non-role-assignable group with privileged Azure access and escalates through Azure resources.",
+    conditionalOn: "What non-role-assignable groups grant (Azure RBAC, app roles, SSO access)." },
+    { id: "Partner Tier1 Support", templateId: "4ba39ca4-527c-499a-b93d-d9b492c50246", escalation: "conditional", tier: 2,
+    plantsCredentials: "any", writesOpenGroups: true,
+    plain: "Retired support role (new assignments blocked since August 2026) that can manage app credentials and ordinary groups. Remove any that remain.",
+    escalationNote: "Same as Application Administrator (app-credential path) and Directory Writers (group path).",
+    conditionalOn: "A more privileged app to backdoor, or groups granting privileged Azure access." },
+    { id: "Helpdesk Administrator", templateId: "729827e3-9c14-49f7-bb1b-9608f156bbb8", escalation: "conditional", tier: 2,
+    plain: "Can reset passwords for non-admins. On its own that doesn't get past MFA.",
+    escalationNote: "Resets the password of a non-admin who controls privilege; only a path where that account has no working MFA. Not in azure-tiering's Tier-0.",
+    conditionalOn: "A non-admin without MFA who owns a privileged app or group." },
+  { id: "Conditional Access Administrator", templateId: "b1be1c3e-b65d-4f19-8427-f6fa0d97feb9", escalation: "direct", tier: 1,
+    impact: "availability",
+    plain: "Can rewrite the sign-in rules for everyone. One policy blocking all users, break-glass included, locks the organisation out.",
+    escalationNote: "Creates a policy blocking every user but its own account from every app and holds the tenant to ransom (Global-Admin-level impact on availability)." },
+  { id: "Tenant Governance Administrator", templateId: "1981f584-96e9-4a6f-95b0-f522373f8fae", escalation: "direct", tier: 1,
+    plain: "Can invite another tenant to govern this one and accept its request, which can hand that tenant Global Admin through GDAP.",
+    escalationNote: "Invites an attacker-controlled tenant to govern this one and accepts a governance policy that grants Global Admin (via GDAP) to a group in the attacker's tenant." },
+  { id: "Customer Delegated Admin Relationship Administrator", templateId: "fc8ad4e2-40e4-4724-8317-bcda7503ecbf", escalation: "conditional", tier: 1,
+    plain: "Can approve delegated-admin (GDAP) requests from partner tenants, including ones asking for Global Admin.",
+    escalationNote: "Approves a GDAP request from an attacker-controlled partner tenant that includes Global Administrator.",
+    conditionalOn: "An incoming GDAP request from an attacker-controlled partner tenant." },
+  { id: "Authentication Administrator", templateId: "c4e39bd9-1100-46d3-8c65-fb160da0071f", escalation: "conditional", tier: 1,
+    plain: "Can issue Temporary Access Passes and reset sign-in methods for non-admins and some admins.",
+    escalationNote: "Issues a TAP to a user who owns an app with privileged Graph permissions, signs in as them (a TAP satisfies MFA), then acts as the app.",
+    conditionalOn: "A user it can manage (not in a role-assignable group or restricted admin unit) who owns a privileged app." },
+  { id: "Agent ID Administrator", templateId: "db506228-d27e-4b7d-95e5-295956d6615f", escalation: "conditional", tier: 1,
+    plain: "Manages AI agent identities, including their credentials. As dangerous as the most privileged agent.",
+    escalationNote: "Impersonates an agent identity with privileged Microsoft Graph permissions.",
+    conditionalOn: "Whether any agent identity holds privileged Microsoft Graph permissions." },
+  { id: "AI Administrator", templateId: "d2562ede-74db-457e-a7b6-544e236ebb61", escalation: "conditional", tier: 1,
+    plain: "Manages Microsoft 365 AI features and agents, including agent identities.",
+    escalationNote: "Same as Agent ID Administrator: impersonates an agent identity with privileged Graph permissions.",
+    conditionalOn: "Whether any agent identity holds privileged Microsoft Graph permissions." },
+  { id: "Entra Backup Administrator", templateId: "b6a27b2b-f905-4b2e-81b5-0d90e0ef1fdb", escalation: "conditional", tier: 1,
+    plain: "Can roll back service principals, users, Conditional Access and the authentication-methods policy to any state from the last 7 days.",
+    escalationNote: "Restores a privileged Graph permission revoked from an attacker's app (or a disabled compromised Global Admin) within the last 7 days.",
+    conditionalOn: "A privileged grant or account removed in the last 7 days, e.g. during incident response." },
+  { id: "External Identity Provider Administrator", templateId: "be2f45a1-457d-42af-a067-6ec1fa63bc45", escalation: "conditional", tier: 1,
+    plain: "Can configure external identity providers for federation.",
+    escalationNote: "Same as Domain Name Administrator: federation that signs in as an existing Global Admin without password or MFA.",
+    conditionalOn: "Tenant federation configuration." },
+  { id: "Identity Governance Administrator", templateId: "45d8d3c5-c802-45c6-b32a-1d70b5e1e86e", escalation: "conditional", tier: 2,
+    writesOpenGroups: true,
+    plain: "Manages access packages and governance, including what access packages grant and who may request them.",
+    escalationNote: "Opens an access package that grants Global Admin to requests without approval; also the Directory Writers group path.",
+    conditionalOn: "An access package granting Global Admin, or groups granting privileged Azure access." },
+  { id: "Lifecycle Workflows Administrator", templateId: "59d46f88-662b-457b-bceb-5c3809e5908f", escalation: "conditional", tier: 2,
+    plain: "Builds joiner/mover/leaver workflows, whose tasks can add users to groups.",
+    escalationNote: "Creates a workflow task that adds a controlled account to a group with privileged Azure access.",
+    conditionalOn: "What non-role-assignable groups grant (Azure RBAC, app roles, SSO access)." },
+  { id: "Azure DevOps Administrator", templateId: "e3973bdf-4987-49ae-837a-ba8e231c7286", escalation: "conditional", tier: 2,
+    plain: "Manages Azure DevOps organisation policy.",
+    escalationNote: "Impersonates a DevOps pipeline that holds privileged Azure permissions and escalates through Azure resources.",
+    conditionalOn: "Pipelines with privileged Azure service connections." },
+  { id: "Directory Writers", templateId: "9360feb5-f418-4baa-8175-e2a00bac4301", escalation: "conditional", tier: 2,
+    writesOpenGroups: true,
+    plain: "Can change membership of ordinary (non-role-assignable) groups, which often grant Azure roles or app access.",
+    escalationNote: "Joins a non-role-assignable group with privileged Azure access and escalates through Azure resources; also gains SSO access gated on such groups.",
+    conditionalOn: "What non-role-assignable groups grant (Azure RBAC, app roles, SSO access)." },
+  { id: "Teams Administrator", templateId: "69091246-20e8-4a56-aa4d-066075b2a7a8", escalation: "conditional", tier: 2,
+    writesOpenGroups: true,
+    plain: "Manages Teams and Microsoft 365 group membership. Can change membership of ordinary (non-role-assignable) groups, which often grant Azure roles or app access.",
+    escalationNote: "Same as Directory Writers: joins a non-role-assignable group with privileged Azure access and escalates through Azure resources.",
+    conditionalOn: "What non-role-assignable groups grant (Azure RBAC, app roles, SSO access)." },
+  { id: "Windows 365 Administrator", templateId: "11451d60-acb2-45eb-a7d6-43d0f0125c13", escalation: "conditional", tier: 2,
+    writesOpenGroups: true,
+    plain: "Manages Cloud PCs and some groups. Can change membership of ordinary (non-role-assignable) groups, which often grant Azure roles or app access.",
+    escalationNote: "Same as Directory Writers: joins a non-role-assignable group with privileged Azure access and escalates through Azure resources.",
+    conditionalOn: "What non-role-assignable groups grant (Azure RBAC, app roles, SSO access)." },
+  { id: "Yammer Administrator", templateId: "810a2642-a034-447f-a5e8-41beaa378541", escalation: "conditional", tier: 2,
+    writesOpenGroups: true,
+    plain: "Manages Viva Engage and some groups. Can change membership of ordinary (non-role-assignable) groups, which often grant Azure roles or app access.",
+    escalationNote: "Same as Directory Writers: joins a non-role-assignable group with privileged Azure access and escalates through Azure resources.",
+    conditionalOn: "What non-role-assignable groups grant (Azure RBAC, app roles, SSO access)." },
+  { id: "Knowledge Administrator", templateId: "b5a8dcf3-09d5-43a9-a639-8e29ef291470", escalation: "conditional", tier: 2,
+    writesOpenGroups: true,
+    plain: "Manages knowledge and content settings, and some groups. Can change membership of ordinary (non-role-assignable) groups, which often grant Azure roles or app access.",
+    escalationNote: "Same as Directory Writers: joins a non-role-assignable group with privileged Azure access and escalates through Azure resources.",
+    conditionalOn: "What non-role-assignable groups grant (Azure RBAC, app roles, SSO access)." },
+  { id: "Knowledge Manager", templateId: "744ec460-397e-42ad-a462-8b3f9747a02c", escalation: "conditional", tier: 2,
+    writesOpenGroups: true,
+    plain: "Manages knowledge content, and some groups. Can change membership of ordinary (non-role-assignable) groups, which often grant Azure roles or app access.",
+    escalationNote: "Same as Directory Writers: joins a non-role-assignable group with privileged Azure access and escalates through Azure resources.",
+    conditionalOn: "What non-role-assignable groups grant (Azure RBAC, app roles, SSO access)." },
+  { id: "SharePoint Advanced Management Administrator", templateId: "99009c4a-3b3f-4957-82a9-9d35e12db77e", escalation: "conditional", tier: 2,
+    writesOpenGroups: true,
+    plain: "Manages SharePoint Advanced Management, and some groups. Can change membership of ordinary (non-role-assignable) groups, which often grant Azure roles or app access.",
+    escalationNote: "Same as Directory Writers: joins a non-role-assignable group with privileged Azure access and escalates through Azure resources.",
+    conditionalOn: "What non-role-assignable groups grant (Azure RBAC, app roles, SSO access)." },
+  { id: "Directory Readers", templateId: "88d8e3e3-8f55-4a1e-953a-9b9898b8876b", escalation: "none", tier: 3,
     plain: "Read-only view of the directory. Low risk by itself.",
     escalationNote: "No known escalation." },
-  { id: "Global Reader", escalation: "none", tier: 3,
+  { id: "Global Reader", templateId: "f2ef992c-3afb-46b9-b7cf-a126ee74c451", escalation: "none", tier: 3,
     plain: "Read-only view of almost everything in the tenant. Strong recon, but no write.",
     escalationNote: "No write access; recon only." },
 ];
@@ -1446,25 +1920,8 @@ const PERM_BY_ID   = Object.fromEntries(PERMISSIONS.map(p => [p.id.toLowerCase()
 const PERM_BY_GUID = Object.fromEntries(PERMISSIONS.filter(p=>p.guid).map(p => [p.guid.toLowerCase(), p]));
 const ROLE_BY_ID   = Object.fromEntries(ROLES.map(r => [r.id.toLowerCase(), r]));
 
-// well-known Entra role template IDs -> our role display names (for raw exports)
-const ROLE_TEMPLATE = {
-  "62e90394-69f5-4237-9190-012177145e10": "Global Administrator",
-  "e8611ab8-c189-46e8-94e1-60213ab1f814": "Privileged Role Administrator",
-  "7be44c8a-adaf-4e2a-84d6-ab2649e08a13": "Privileged Authentication Administrator",
-  "9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3": "Application Administrator",
-  "158c047a-c907-4556-b7ef-446551a6b5f7": "Cloud Application Administrator",
-  "8ac3fc64-6eca-42ea-9e69-59f4c7b60eb2": "Hybrid Identity Administrator",
-  "3a2c62db-5318-420d-8d74-23affee5d9d5": "Intune Administrator",
-  "194ae4cb-b126-40b2-bd5b-6091b380977d": "Security Administrator",
-  "fe930be7-5e62-47db-91af-98c3a49a38b1": "User Administrator",
-  "29232cdf-9323-42fd-ade2-1d097af3e4de": "Exchange Administrator",
-  "f28a1f50-f6e7-4571-818b-6a12f2af6b6c": "SharePoint Administrator",
-  "fdd7a751-b60b-444a-984c-02652fe8fa1c": "Groups Administrator",
-  "729827e3-9c14-49f7-bb1b-9608f156bbb8": "Helpdesk Administrator",
-  "88d8e3e3-8f55-4a1e-953a-9b9898b8876b": "Directory Readers",
-  "f2ef992c-3afb-46b9-b7cf-a126ee74c451": "Global Reader",
-  "e00e864a-17c5-4a4b-9c06-f5b95a8d5bd8": "Partner Tier2 Support",
-};
+// role template GUID -> KB role name, built from the KB (templateId on each role)
+const ROLE_TEMPLATE = Object.fromEntries(ROLES.filter(r => r.templateId).map(r => [r.templateId.toLowerCase(), r.id]));
 
 const REACH_LABELS = {
   mail:        { name: "Email", tech: "All mailboxes (read/write/send)", biz: "Every inbox in the company, including executives and finance." },
@@ -1505,7 +1962,9 @@ function analyzeApp(perms, roles, appType) {
   let sev = "none";
   const directReasons = [], condReasons = [];
   all.forEach(item => {
-    if (item.escalation === "direct") directReasons.push(item);
+    // selfEscalates: rated Indirect upstream, but the extra step is granting itself a
+    // Direct permission, which needs nothing in the tenant. Both modes treat it as direct.
+    if (item.escalation === "direct" || item.selfEscalates) directReasons.push(item);
     else if (item.escalation === "conditional") condReasons.push(item);
   });
   if (directReasons.length) sev = "direct";
@@ -1517,6 +1976,11 @@ function analyzeApp(perms, roles, appType) {
 
   const hasStealthyRead = perms.some(p => (p.tags||[]).includes("stealthy") || (p.tags||[]).includes("directory-read"));
   return { appType, perms, roles, all, sev, directReasons, condReasons, reads, writes, hasStealthyRead };
+}
+
+// True when every Direct reason is an availability (lockout) permission.
+function isLockoutOnly(a) {
+  return a.directReasons.length > 0 && a.directReasons.every(r => r.impact === "availability");
 }
 
 function resolvePerm(token) {
@@ -1571,9 +2035,9 @@ function renderPickList() {
     const row = document.createElement("label");
     row.className = "pick-item";
     const checked = selected.has(it.id.toLowerCase()) ? "checked" : "";
-    row.innerHTML = `<input type="checkbox" ${checked} data-id="${it.id.toLowerCase()}">
-      <span><span class="pm">${it.id}</span><span class="pm-api"> · ${it.api}</span></span>
-      <span class="pm-dot dot-${it.tier}" title="Tier ${it.tier}"></span>`;
+    row.innerHTML = `<input type="checkbox" ${checked} data-id="${escapeHtml(it.id.toLowerCase())}">
+      <span><span class="pm">${escapeHtml(it.id)}</span><span class="pm-api"> · ${escapeHtml(it.api)}</span></span>
+      <span class="pm-dot dot-${escapeHtml(it.tier)}" title="Tier ${escapeHtml(it.tier)}"></span>`;
     row.querySelector("input").addEventListener("change", e => {
       if (e.target.checked) selected.add(it.id.toLowerCase()); else selected.delete(it.id.toLowerCase());
       renderTray();
@@ -1589,7 +2053,7 @@ function renderTray() {
     const label = item ? item.id : id;
     const chip = document.createElement("span");
     chip.className = "tray-chip";
-    chip.innerHTML = `<span>${label}</span><button class="x" aria-label="Remove ${label}">×</button>`;
+    chip.innerHTML = `<span>${escapeHtml(label)}</span><button class="x" aria-label="Remove ${escapeHtml(label)}">×</button>`;
     chip.querySelector(".x").addEventListener("click", () => { selected.delete(id); renderTray(); renderPickList(); });
     host.appendChild(chip);
   });
@@ -1652,6 +2116,12 @@ function verdictBlock(a) {
     none:        { badge: "NO KNOWN PATH", title: "No known takeover path from these permissions.",
                    sub: "Nothing here maps to a known Global Admin escalation. That is not the same as “safe.” Reach can still be large." },
   }[a.sev];
+  // Direct only through lockout permissions: Global-Admin-level impact, but not Global Admin's privileges.
+  if (a.sev === "direct" && isLockoutOnly(a)) {
+    cfg.badge = "YES: LOCKOUT";
+    cfg.title = "This app can lock everyone out of the tenant.";
+    cfg.sub = "It can't make itself Global Admin, but it can block or remove every account, break-glass included, and hold the tenant to ransom. Researchers rate that as Global-Admin-level impact.";
+  }
   let why = "";
   const reasons = a.sev === "direct" ? a.directReasons : a.sev === "conditional" ? a.condReasons : [];
   if (reasons.length) {
@@ -1879,7 +2349,7 @@ function normalizeTenant(raw) {
 // ============================================================================
 function analyzeTenant(raw, opts) {
   const { tenantId, generatedAt, sps, groups } = normalizeTenant(raw);
-  const now = Date.now();
+  const now = (opts && opts.now) || Date.now();
   const haveGroupData = Array.isArray(groups) && groups.length > 0;
   // a bare yyyy-mm-dd parses as UTC midnight; anchor to local midnight instead
   const sinceTs = (opts && opts.since) ? credTime(/^\d{4}-\d{2}-\d{2}$/.test(opts.since) ? opts.since + "T00:00:00" : opts.since) : null;
@@ -1922,9 +2392,7 @@ function analyzeTenant(raw, opts) {
     // ---- group-write capability (BloodHound post-processing rules) ----
     // Plain group-write perms reach ONLY non-role-assignable groups.
     sp.canWriteOpenGroups =
-      permIds.has("Group.ReadWrite.All") || permIds.has("GroupMember.ReadWrite.All") ||
-      permIds.has("Directory.ReadWrite.All") ||
-      roleIds.has("Groups Administrator") || roleIds.has("User Administrator");
+      sp.perms.concat(sp.roleObjs).some(x => x.writesOpenGroups);
     // RoleManagement.ReadWrite.Directory reaches ALL groups incl. role-assignable
     // (but it's already a direct GA escalator, so it doesn't need the group path).
 
@@ -1946,19 +2414,22 @@ function analyzeTenant(raw, opts) {
 
     // base: reaches Global Admin on its own (tenant-independent + already-held group roles)?
     sp.baseGA = sp.analysis.sev === "direct"
-      || permIds.has("AppRoleAssignment.ReadWrite.All")
+      || sp.perms.some(p => p.selfEscalates)          // grants itself a Direct permission
       || !!sp.memberPrivGroup                  // already a member of a GA-carrying group
       || !!sp.ownsPrivGroup;                   // owns a GA-carrying group -> can add itself
     sp.reachesGA = sp.baseGA;
+    // Direct only through lockout (availability) permissions: Global-Admin-level
+    // impact, not Global Admin's privileges. Anything else that reaches GA wins.
+    sp.lockoutOnly = sp.baseGA && isLockoutOnly(sp.analysis)
+      && !sp.perms.some(p => p.selfEscalates) && !sp.memberPrivGroup && !sp.ownsPrivGroup;
     sp.gaProof = null;
     sp.groupProof = null;
     if (sp.memberPrivGroup) sp.groupProof = { group: sp.memberPrivGroup, how: "is already a member of" };
     else if (sp.ownsPrivGroup) sp.groupProof = { group: sp.ownsPrivGroup, how: "owns (can add itself to)" };
 
     // app-credential backdoor capability
-    sp.canModAll = permIds.has("Application.ReadWrite.All")
-      || roleIds.has("Application Administrator") || roleIds.has("Cloud Application Administrator");
-    sp.canModOwned = permIds.has("Application.ReadWrite.OwnedBy");
+    sp.canModAll = sp.perms.concat(sp.roleObjs).some(x => x.plantsCredentials === "any");
+    sp.canModOwned = sp.perms.some(p => p.plantsCredentials === "owned");
 
     sp.credFlags = credentialFlags(sp, now, sinceTs);
   });
@@ -1993,15 +2464,16 @@ function analyzeTenant(raw, opts) {
   while (changed && guard++ < 16) {
     changed = false;
     sps.forEach(sp => {
-      if (sp.reachesGA) return;
+      if (sp.reachesGA && !sp.lockoutOnly) return;
       let appTargets = [];
       if (sp.canModAll) appTargets = sps.filter(o => o !== sp);
       else if (sp.canModOwned) appTargets = (sp.ownedAppIds || []).map(a => byAppId[a]).filter(Boolean);
       // ownership edge: apps this SP owns, it can backdoor
       appTargets = appTargets.concat(sp.ownsAppObjs || []);
-      const appProof = appTargets.find(o => o.reachesGA);
+      const appProof = appTargets.find(o => o.reachesGA && !o.lockoutOnly)
+        || (sp.reachesGA ? null : appTargets.find(o => o.reachesGA));
       if (appProof) {
-        sp.reachesGA = true; sp.gaProof = appProof;
+        sp.reachesGA = true; sp.gaProof = appProof; sp.lockoutOnly = !!appProof.lockoutOnly;
         if ((sp.ownsAppObjs||[]).includes(appProof) && !sp.canModAll && !sp.canModOwned) sp.gaViaOwnership = true;
         changed = true;
       }
@@ -2029,7 +2501,7 @@ function analyzeTenant(raw, opts) {
   sps.forEach(sp => {
     if (sp.reachesGA) {
       sp.finalSev = "direct";
-      const selfDirect = sp.analysis.sev === "direct" || sp.perms.some(p=>p.id==="AppRoleAssignment.ReadWrite.All");
+      const selfDirect = sp.analysis.sev === "direct" || sp.perms.some(p => p.selfEscalates);
       // "confirmedViaChain" means proven by the app-credential backdoor path specifically
       sp.confirmedViaChain = !selfDirect && !!sp.gaProof;
       // group-confirmed is tracked separately via sp.groupProof
@@ -2050,8 +2522,8 @@ function analyzeTenant(raw, opts) {
         if (onlyGroupCond && sp.canWriteOpenGroups) {
           const n = rolePrivGroups.length;
           sp.groupCleared = n
-            ? `Group data reviewed: the ${n} privileged group${n>1?"s":""} in this tenant ${n>1?"are":"is"} role-assignable, which plain group-write cannot modify. No confirmed directory-role path. (A non-role-assignable group could still grant access via app-role or access-package assignments, which this export does not capture.)`
-            : `Group data reviewed: no group in this tenant carries a privileged directory role. (A non-role-assignable group could still grant access via app-role or access-package assignments, which this export does not capture.)`;
+            ? `Group data reviewed: the ${n} privileged group${n>1?"s":""} in this tenant ${n>1?"are":"is"} role-assignable, which plain group-write cannot modify. No confirmed directory-role path. (A non-role-assignable group could still grant access via app-role assignments, Azure role assignments or access packages, which this export does not capture.)`
+            : `Group data reviewed: no group in this tenant carries a privileged directory role. (A non-role-assignable group could still grant access via app-role assignments, Azure role assignments or access packages, which this export does not capture.)`;
         }
       }
     }
@@ -2065,7 +2537,8 @@ function analyzeTenant(raw, opts) {
     disabled: sps.filter(s => !s.enabled).length,
     vendor: sps.filter(s => s.appType === "multi-tenant").length,
     own: sps.filter(s => s.appType === "single-tenant").length,
-    ga: sps.filter(s => s.finalSev === "direct").length,
+    ga: sps.filter(s => s.finalSev === "direct" && !s.lockoutOnly).length,
+    lockout: sps.filter(s => s.finalSev === "direct" && s.lockoutOnly).length,
     gaChained: sps.filter(s => s.confirmedViaChain || (s.groupProof && s.groupProof.how.startsWith("owns"))).length,
     conditional: sps.filter(s => s.finalSev === "conditional").length,
     withRoles: sps.filter(s => s.roleObjs.length).length,
@@ -2080,7 +2553,12 @@ function analyzeTenant(raw, opts) {
     privGroups: (groups || []).filter(g => g.rolePrivileged).length,
   };
 
-  return { tenantId, generatedAt, sps, roll, byAppId, groups: groups || [], haveGroupData };
+  // Gaps in the export that switch checks off. Say so where results are shown,
+  // because a check that couldn't run looks exactly like a clean result.
+  const warnings = [];
+  if (!tenantId) warnings.push({ code: "no-tenant-id",
+    text: "This export has no tenantId, so vendor apps can't be told apart from your own. The cross-tenant credential checks (vendor-owned and Microsoft first-party service principals) did not run, and their count of 0 is not a clean result. Re-run the export script, which records tenantId." });
+  return { tenantId, generatedAt, sps, roll, byAppId, groups: groups || [], haveGroupData, warnings };
 }
 
 // Returns an array of { text, sev, why } flags. sev: "high" | "med".
@@ -2119,11 +2597,11 @@ function credentialFlags(sp, now, sinceTs) {
     if (!isMs && !alEntry) {
       flags.push({ code: "xtenant", sev: "high",
         text: `Tenant-side credential on a vendor (externally-owned) app`,
-        why: `This service principal is owned by another tenant (${escapeHtml(String(sp.ownerOrg))}), yet carries ${all.length} credential(s) in yours. Vendor credentials normally live in the vendor's tenant. A credential here matches the known persistence pattern (attacker-planted secret). Review and remove if you did not create it.` });
+        why: `This service principal is owned by another tenant (${String(sp.ownerOrg)}), yet carries ${all.length} credential(s) in yours. Vendor credentials normally live in the vendor's tenant. A credential here matches the known persistence pattern (attacker-planted secret). Review and remove if you did not create it.` });
     } else if (alEntry) {
       flags.push({ code: "xtenant-allow", sev: "med",
         text: `Cross-tenant credential (allowlisted)`,
-        why: `A tenant-side credential on this external app would normally flag, but it is on the allowlist: "${escapeHtml(alEntry.reason||"no reason given")}". Re-confirm this is still intended.` });
+        why: `A tenant-side credential on this external app would normally flag, but it is on the allowlist: "${alEntry.reason||"no reason given"}". Re-confirm this is still intended.` });
     }
   }
 
@@ -2140,7 +2618,7 @@ function credentialFlags(sp, now, sinceTs) {
       const years = (end - start) / (365.25 * 864e5);
       const cName = c.displayName || c.DisplayName;
       if (years > 2) flags.push({ code: "longlived", sev: "med",
-        text: `Long-lived ${c.kind} (${years.toFixed(1)} yr)${cName ? ' “'+escapeHtml(cName)+'”' : ""}`,
+        text: `Long-lived ${c.kind} (${years.toFixed(1)} yr)${cName ? ' “'+cName+'”' : ""}`,
         why: `A multi-year credential${srcLabel} is ideal for persistence; short lifetimes limit a stolen secret's window.` });
     }
     if (start && now && start > now - 14 * 864e5) flags.push({ code: "recent", sev: "med",
@@ -2162,7 +2640,7 @@ function credentialFlags(sp, now, sinceTs) {
 
 function pimSentence(sp) {
   const how = sp.pimGroup
-    ? `through the group “${escapeHtml(sp.pimGroup.name)}”, which is PIM-eligible for a Global Admin-equivalent role`
+    ? `through the group “${sp.pimGroup.name}”, which is PIM-eligible for a Global Admin-equivalent role`
     : "by activating a PIM-eligible role";
   return `Reaches Global Admin only ${how}. Activation is a gated, logged step (often MFA plus approval), not standing access. Still a path, but weaker than a standing assignment.`;
 }
@@ -2222,12 +2700,14 @@ function rollupBlock(d) {
     : "";
   const blindspot = `<div class="blindspot"><span class="bs-ic">◐</span><div><b>What this can't see.</b> It reasons only from what's in the export: it doesn't log in, confirm activity, or capture app-role/access-package grants on non-role-assignable groups or Azure RBAC. “No known path” means nothing in the knowledge base matched for the data provided, not that an app is safe.</div></div>`;
   el.innerHTML = `<h3>Tenant rollup</h3>
-    <p class="rsub">${r.total} apps analyzed${d.tenantId ? ` in tenant ${d.tenantId}` : ""}. ${meta}</p>
+    <p class="rsub">${r.total} apps analyzed${d.tenantId ? ` in tenant ${escapeHtml(d.tenantId)}` : ""}. ${meta}</p>
+    ${(d.warnings || []).map(w => `<div class="blindspot" data-warning="${escapeHtml(w.code)}"><span class="bs-ic">⚠</span><div><b>Check not run.</b> ${escapeHtml(w.text)}</div></div>`).join("")}
     <div class="stat-grid">
       ${stat(r.ga, "can reach Global Admin", r.ga ? "alarm" : "")}
+      ${r.lockout ? stat(r.lockout, "can lock the tenant (GA-level impact)", "alarm") : ""}
       ${stat(r.gaChained, "only via a backdoor/group chain", r.gaChained ? "alarm" : "")}
       ${stat(r.pimGa, "GA via PIM activation (gated)", r.pimGa ? "warn" : "")}
-      ${stat(r.crossTenantCreds, "cross-tenant credentials", r.crossTenantCreds ? "alarm" : "")}
+      ${d.tenantId ? stat(r.crossTenantCreds, "cross-tenant credentials", r.crossTenantCreds ? "alarm" : "") : stat("n/a", "cross-tenant credentials (not checked)", "warn")}
       ${stat(r.conditional, "conditional (unverified)", r.conditional ? "warn" : "")}
       ${stat(r.withRoles, "hold a directory role", r.withRoles ? "warn" : "")}
       ${stat(r.suspCreds, "credential concerns", r.suspCreds ? "warn" : "")}
@@ -2280,7 +2760,7 @@ function paintAppRows(d) {
 
 function appRow(sp) {
   const sev = sp.finalSev;
-  const verdict = sev === "direct" ? (sp.viaPim ? "GA · PIM-GATED" : "GLOBAL ADMIN") : sev === "conditional" ? "CONDITIONAL" : "NO KNOWN PATH";
+  const verdict = sev === "direct" ? (sp.viaPim ? "GA · PIM-GATED" : sp.lockoutOnly ? "LOCKOUT · GA-LEVEL" : "GLOBAL ADMIN") : sev === "conditional" ? "CONDITIONAL" : "NO KNOWN PATH";
   const badges = [];
   badges.push(sp.appType === "multi-tenant" ? `<span class="abadge vendor">vendor</span>` : `<span class="abadge own">own app</span>`);
   if (!sp.enabled) badges.push(`<span class="abadge disabled">disabled</span>`);
@@ -2298,7 +2778,7 @@ function appRow(sp) {
       <span class="app-dot ${sev}"></span>
       <span class="app-id-wrap">
         <div class="app-name">${escapeHtml(sp.name)}</div>
-        <div class="app-sub">${sp.appId || "no app id"}</div>
+        <div class="app-sub">${escapeHtml(sp.appId || "no app id")}</div>
       </span>
       <span class="app-badges">${badges.join("")}</span>
       <span class="app-verdict ${sev}">${verdict}</span>
@@ -2324,7 +2804,7 @@ function appDetail(sp) {
       html += proofChain(sp);
     } else {
       const reasons = sp.analysis.directReasons.length ? sp.analysis.directReasons
-        : sp.perms.filter(p => p.id === "AppRoleAssignment.ReadWrite.All");
+        : sp.perms.filter(p => p.selfEscalates);
       html += `<div style="font-size:12.5px;color:var(--text-dim)">`;
       reasons.slice(0,4).forEach(r => { html += `• <code style="font-family:var(--mono);color:var(--text)">${r.id}</code>: ${r.escalationNote || r.plain}<br>`; });
       if (sp.roleObjs.some(r=>r.escalation==="direct")) sp.roleObjs.filter(r=>r.escalation==="direct").forEach(r => html += `• role <code style="font-family:var(--mono);color:var(--text)">${r.id}</code>: ${r.escalationNote}<br>`);
@@ -2357,9 +2837,9 @@ function appDetail(sp) {
     sp.roleObjs.forEach(r => html += `<span class="mini-chip ${r.escalation==="direct"?"hot":""}">${escapeHtml(r.id)}</span>`);
     (sp.roleObjsEligible||[]).forEach(r => html += `<span class="mini-chip ${r.escalation==="direct"?"hot":""}" title="Eligible via PIM; requires activation">${escapeHtml(r.id)} · PIM-eligible</span>`);
     html += `</div>`;
-    if (sp.viaPim) html += `<div style="font-size:12px;color:var(--caution);margin-top:7px">${pimSentence(sp)}</div>`;
+    if (sp.viaPim) html += `<div style="font-size:12px;color:var(--caution);margin-top:7px">${escapeHtml(pimSentence(sp))}</div>`;
   } else if (sp.viaPim) {
-    html += `<div class="sec-t">Directory roles</div><div style="font-size:12px;color:var(--caution)">${pimSentence(sp)}</div>`;
+    html += `<div class="sec-t">Directory roles</div><div style="font-size:12px;color:var(--caution)">${escapeHtml(pimSentence(sp))}</div>`;
   }
 
   // 3b. ownership paths
@@ -2392,7 +2872,7 @@ function proofChain(sp) {
   let cur = sp.gaProof, guard = 0;
   while (cur && guard++ < 12) {
     const why = cur.baseGA
-      ? (cur.analysis.directReasons[0]?.id || "AppRoleAssignment.ReadWrite.All")
+      ? (cur.analysis.directReasons[0]?.id || (cur.perms.find(p => p.selfEscalates) || {}).id || "a self-escalating permission")
       : (cur.canModAll ? "can add a credential to any app" : "backdoors another app");
     nodes.push({ name: cur.name, why, ga: cur.baseGA });
     if (cur.baseGA) break;
@@ -2483,9 +2963,9 @@ function extractRoleTokens(x) {
   return [];
 }
 
-function analyzePartner(raw) {
+function analyzePartner(raw, opts) {
   const { partnerTenantId, generatedAt, rels, assigns, groups, principals } = normalizePartner(raw);
-  const now = Date.now();
+  const now = (opts && opts.now) || Date.now();
 
   const groupById = {};
   groups.forEach(g => { if (g.id) groupById[g.id] = g; });
@@ -2612,7 +3092,7 @@ function partnerRollupBlock(d) {
   const stat = (num, lbl, cls="") => `<div class="stat ${cls}"><div class="num">${num}</div><div class="lbl">${lbl}</div></div>`;
   const meta = d.generatedAt ? `exported ${new Date(d.generatedAt).toLocaleString()}` : "";
   el.innerHTML = `<h3>Partner cross-tenant reach</h3>
-    <p class="rsub">${r.customers} customer tenant${r.customers===1?"":"s"} reachable from this partner${d.partnerTenantId ? ` (${d.partnerTenantId})` : ""}. ${meta}</p>
+    <p class="rsub">${r.customers} customer tenant${r.customers===1?"":"s"} reachable from this partner${d.partnerTenantId ? ` (${escapeHtml(d.partnerTenantId)})` : ""}. ${meta}</p>
     <div class="stat-grid">
       ${stat(r.fullTakeover, "customers fully takeable (GA-equiv reachable)", r.fullTakeover ? "alarm" : "")}
       ${stat(r.legacyDap, "legacy DAP (standing GA)", r.legacyDap ? "alarm" : "")}
@@ -2700,7 +3180,7 @@ function custRow(c) {
       <span class="app-dot ${c.sev}"></span>
       <span style="flex:1;min-width:0">
         <div class="cust-name">${escapeHtml(c.name)}</div>
-        <div class="cust-sub">${c.id || "no tenant id"}</div>
+        <div class="cust-sub">${escapeHtml(c.id || "no tenant id")}</div>
       </span>
       <span class="cust-badges"><span class="relstat ${c.relstat}">${relLabel}</span></span>
       <span class="cust-verdict ${c.sev}">${verdict}</span>
@@ -2820,7 +3300,7 @@ function printReport(mode) {
 // ---- report HTML builder (light theme, system fonts, print CSS) ----
 function reportHead(title) {
   return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${escapeHtml(title)}</title>
 <style>
@@ -2883,8 +3363,7 @@ function reportHead(title) {
   @media (max-width:640px){ .stats { grid-template-columns:repeat(2,1fr); } .page{padding:24px 20px;} .toolbar{padding:12px 20px;} }
 </style></head><body>
 <div class="toolbar">
-  <button class="primary" onclick="window.print()">Print / Save as PDF</button>
-  <span class="tnote">Opens your browser's print dialog. Choose “Save as PDF” as the destination.</span>
+  <span class="tnote"><b>To print or save as PDF:</b> press Ctrl+P (⌘P on a Mac) and choose “Save as PDF” as the destination. This report contains no scripts.</span>
 </div>
 <div class="page">`;
 }
@@ -2932,6 +3411,8 @@ function reportSingle(title) {
   const a = singleData;
   if (!a) return reportHead(title) + "<p>Run an analysis first.</p>" + reportFoot();
   const cfg = verdictCfgReport(a.sev);
+  if (a.sev === "direct" && isLockoutOnly(a)) Object.assign(cfg, { badge: "CAN LOCK THE TENANT",
+    t: "Every account can be locked out.", s: "No path to Global Admin's privileges, but it can block or remove every account, break-glass included: Global-Admin-level impact on availability." });
   const typeLabel = a.appType === "multi-tenant" ? "Vendor (multi-tenant)" : "Single-tenant (your own)";
   let html = reportHead(title);
   html += reportHeader(title, `<b>Scope:</b> a single ${typeLabel} application · ${a.perms.length} permission(s), ${a.roles.length} directory role(s) analyzed`);
@@ -2993,9 +3474,10 @@ function reportTenant(title) {
   html += reportHeader(title, `<b>Scope:</b> ${r.total} applications in ${d.tenantId ? "tenant " + escapeHtml(d.tenantId) : "the tenant"}${d.haveGroupData ? ` · ${r.groupCount} groups included` : ""}`);
 
   html += `<h2 class="sec">Executive summary</h2>`;
+  (d.warnings || []).forEach(w => { html += `<p style="border-left:3px solid var(--amber);background:var(--amberbg);padding:8px 12px"><b>Check not run.</b> ${escapeHtml(w.text)}</p>`; });
   html += `<p class="lede">Of ${r.total} applications analyzed, <b>${r.ga}</b> can reach Global Administrator` +
     (r.gaChained ? ` (${r.gaChained} only by chaining through another app or a group)` : "") +
-    `. ${r.conditional} more are conditional, ${r.withRoles} hold a directory role, and ${r.suspCreds} carry credential-hygiene concerns. ` +
+    `.` + (r.lockout ? ` ${r.lockout} more can lock every account out of the tenant (Global-Admin-level impact on availability, without Global Admin's privileges).` : "") + ` ${r.conditional} more are conditional, ${r.withRoles} hold a directory role, and ${r.suspCreds} carry credential-hygiene concerns. ` +
     `${r.vendor} are vendor (multi-tenant) apps whose credential you cannot rotate.` +
     (r.pimGa ? ` ${r.pimGa} of the Global Admin paths ${r.pimGa>1?"are":"is"} PIM-gated: reachable only through a logged activation.` : "") +
     (r.crossTenantCreds ? ` <b>${r.crossTenantCreds} ${r.crossTenantCreds>1?"apps carry":"app carries"} a credential on a vendor or Microsoft-owned service principal, the persistence pattern from the ConnectWise incident.</b>` : "") +
@@ -3004,6 +3486,7 @@ function reportTenant(title) {
 
   html += `<div class="stats">
     ${rstat(r.ga,"reach Global Admin",r.ga?"red":"")}
+    ${r.lockout ? rstat(r.lockout,"can lock the tenant",'red') : ""}
     ${rstat(r.gaChained,"via a backdoor/group chain",r.gaChained?"red":"")}
     ${rstat(r.pimGa,"GA via PIM activation",r.pimGa?"amber":"")}
     ${rstat(r.crossTenantCreds,"cross-tenant credentials",r.crossTenantCreds?"red":"")}
@@ -3024,7 +3507,7 @@ function reportTenant(title) {
       else if (sp.groupProof) { const g = sp.groupProof.group; why = `${sp.groupProof.how} the ${g.roleAssignable?"role-assignable ":""}group “${escapeHtml(g.name)}”, which holds a privileged role`; }
       else if (sp.gaViaOwnership && sp.gaProof) why = `owns the more privileged app “${escapeHtml(sp.gaProof.name)}” and can add a credential to it`;
       else if (sp.confirmedViaChain && sp.gaProof) why = `can plant a credential on the more privileged app “${escapeHtml(sp.gaProof.name)}” and inherit it`;
-      else { const rr = (sp.analysis.directReasons[0]||sp.perms.find(p=>p.id==="AppRoleAssignment.ReadWrite.All")); why = rr ? `holds ${escapeHtml(rr.id)}` : (sp.roleObjs.find(x=>x.escalation==="direct") ? `holds the ${escapeHtml(sp.roleObjs.find(x=>x.escalation==="direct").id)} role` : "holds a direct-escalation permission"); }
+      else { const rr = (sp.analysis.directReasons[0]||sp.perms.find(p => p.selfEscalates)); why = rr ? `holds ${escapeHtml(rr.id)}` : (sp.roleObjs.find(x=>x.escalation==="direct") ? `holds the ${escapeHtml(sp.roleObjs.find(x=>x.escalation==="direct").id)} role` : "holds a direct-escalation permission"); }
       html += `<div class="finding red"><b>${escapeHtml(sp.name)}</b> <span class="muted">(${sp.appType==="multi-tenant"?"vendor":"own"}${sp.enabled?"":", disabled"})</span>: ${why}.</div>`;
     });
   }
@@ -3037,7 +3520,7 @@ function reportTenant(title) {
       const items = (sp.credFlags||[]).concat(sp.ownerFindings||[]);
       const red = items.some(f => f.sev === "high");
       html += `<div class="finding ${red?"red":"amber"}"><b>${escapeHtml(sp.name)}</b><ul style="margin:6px 0 0 18px;padding:0">` +
-        items.map(f => `<li><b>${escapeHtml(f.text)}.</b> ${f.why}</li>`).join("") + `</ul></div>`;
+        items.map(f => `<li><b>${escapeHtml(f.text)}.</b> ${escapeHtml(f.why)}</li>`).join("") + `</ul></div>`;
     });
   }
 
@@ -3045,7 +3528,7 @@ function reportTenant(title) {
   html += `<h2 class="sec">Application inventory</h2>`;
   html += `<table><thead><tr><th>Application</th><th>Type</th><th>Verdict</th><th>Roles</th><th>Flags</th></tr></thead><tbody>`;
   d.sps.slice().sort((a,b)=>b.riskScore-a.riskScore).forEach(sp => {
-    const v = sp.finalSev; const vl = v==="direct"?(sp.viaPim?"Global Admin (PIM-gated)":"Global Admin"):v==="conditional"?"Conditional":"No known path";
+    const v = sp.finalSev; const vl = v==="direct"?(sp.viaPim?"Global Admin (PIM-gated)":sp.lockoutOnly?"Lockout (Global-Admin-level impact)":"Global Admin"):v==="conditional"?"Conditional":"No known path";
     const flags = []; if (!sp.enabled) flags.push("disabled"); if (hasCrossTenantCred(sp)) flags.push("cross-tenant cred"); else if (sp.credFlags.length) flags.push("cred concern");
     if (sp.gaViaOwnership) flags.push("via ownership"); if (sp.ownerFindings && sp.ownerFindings.length) flags.push("human owner"); if (sp.groupProof) flags.push("via group"); if (sp.groupCleared) flags.push("group-cleared");
     html += `<tr><td><b>${escapeHtml(sp.name)}</b><br><span class="muted" style="font-size:11px">${escapeHtml(sp.appId||"")}</span></td>` +
@@ -3393,7 +3876,7 @@ function doTenantAnalyze(rawText) {
     const data = analyzeTenant(rawText, since ? { since } : undefined);
     data.since = since;
     note.className = "parse-note ok";
-    note.textContent = `Parsed ${data.roll.total} apps. ${data.roll.ga} can reach Global Admin.` + (since ? ` Showing changes since ${since}.` : "");
+    note.textContent = `Parsed ${data.roll.total} apps. ${data.roll.ga} can reach Global Admin.` + (data.roll.lockout ? ` ${data.roll.lockout} can lock the tenant.` : "") + (since ? ` Showing changes since ${since}.` : "");
     renderTenant(data);
   } catch (e) {
     note.className = "parse-note err";

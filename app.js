@@ -18,25 +18,8 @@ const PERM_BY_ID   = Object.fromEntries(PERMISSIONS.map(p => [p.id.toLowerCase()
 const PERM_BY_GUID = Object.fromEntries(PERMISSIONS.filter(p=>p.guid).map(p => [p.guid.toLowerCase(), p]));
 const ROLE_BY_ID   = Object.fromEntries(ROLES.map(r => [r.id.toLowerCase(), r]));
 
-// well-known Entra role template IDs -> our role display names (for raw exports)
-const ROLE_TEMPLATE = {
-  "62e90394-69f5-4237-9190-012177145e10": "Global Administrator",
-  "e8611ab8-c189-46e8-94e1-60213ab1f814": "Privileged Role Administrator",
-  "7be44c8a-adaf-4e2a-84d6-ab2649e08a13": "Privileged Authentication Administrator",
-  "9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3": "Application Administrator",
-  "158c047a-c907-4556-b7ef-446551a6b5f7": "Cloud Application Administrator",
-  "8ac3fc64-6eca-42ea-9e69-59f4c7b60eb2": "Hybrid Identity Administrator",
-  "3a2c62db-5318-420d-8d74-23affee5d9d5": "Intune Administrator",
-  "194ae4cb-b126-40b2-bd5b-6091b380977d": "Security Administrator",
-  "fe930be7-5e62-47db-91af-98c3a49a38b1": "User Administrator",
-  "29232cdf-9323-42fd-ade2-1d097af3e4de": "Exchange Administrator",
-  "f28a1f50-f6e7-4571-818b-6a12f2af6b6c": "SharePoint Administrator",
-  "fdd7a751-b60b-444a-984c-02652fe8fa1c": "Groups Administrator",
-  "729827e3-9c14-49f7-bb1b-9608f156bbb8": "Helpdesk Administrator",
-  "88d8e3e3-8f55-4a1e-953a-9b9898b8876b": "Directory Readers",
-  "f2ef992c-3afb-46b9-b7cf-a126ee74c451": "Global Reader",
-  "e00e864a-17c5-4a4b-9c06-f5b95a8d5bd8": "Partner Tier2 Support",
-};
+// role template GUID -> KB role name, built from the KB (templateId on each role)
+const ROLE_TEMPLATE = Object.fromEntries(ROLES.filter(r => r.templateId).map(r => [r.templateId.toLowerCase(), r.id]));
 
 const REACH_LABELS = {
   mail:        { name: "Email", tech: "All mailboxes (read/write/send)", biz: "Every inbox in the company, including executives and finance." },
@@ -77,7 +60,9 @@ function analyzeApp(perms, roles, appType) {
   let sev = "none";
   const directReasons = [], condReasons = [];
   all.forEach(item => {
-    if (item.escalation === "direct") directReasons.push(item);
+    // selfEscalates: rated Indirect upstream, but the extra step is granting itself a
+    // Direct permission, which needs nothing in the tenant. Both modes treat it as direct.
+    if (item.escalation === "direct" || item.selfEscalates) directReasons.push(item);
     else if (item.escalation === "conditional") condReasons.push(item);
   });
   if (directReasons.length) sev = "direct";
@@ -89,6 +74,11 @@ function analyzeApp(perms, roles, appType) {
 
   const hasStealthyRead = perms.some(p => (p.tags||[]).includes("stealthy") || (p.tags||[]).includes("directory-read"));
   return { appType, perms, roles, all, sev, directReasons, condReasons, reads, writes, hasStealthyRead };
+}
+
+// True when every Direct reason is an availability (lockout) permission.
+function isLockoutOnly(a) {
+  return a.directReasons.length > 0 && a.directReasons.every(r => r.impact === "availability");
 }
 
 function resolvePerm(token) {
@@ -143,9 +133,9 @@ function renderPickList() {
     const row = document.createElement("label");
     row.className = "pick-item";
     const checked = selected.has(it.id.toLowerCase()) ? "checked" : "";
-    row.innerHTML = `<input type="checkbox" ${checked} data-id="${it.id.toLowerCase()}">
-      <span><span class="pm">${it.id}</span><span class="pm-api"> · ${it.api}</span></span>
-      <span class="pm-dot dot-${it.tier}" title="Tier ${it.tier}"></span>`;
+    row.innerHTML = `<input type="checkbox" ${checked} data-id="${escapeHtml(it.id.toLowerCase())}">
+      <span><span class="pm">${escapeHtml(it.id)}</span><span class="pm-api"> · ${escapeHtml(it.api)}</span></span>
+      <span class="pm-dot dot-${escapeHtml(it.tier)}" title="Tier ${escapeHtml(it.tier)}"></span>`;
     row.querySelector("input").addEventListener("change", e => {
       if (e.target.checked) selected.add(it.id.toLowerCase()); else selected.delete(it.id.toLowerCase());
       renderTray();
@@ -161,7 +151,7 @@ function renderTray() {
     const label = item ? item.id : id;
     const chip = document.createElement("span");
     chip.className = "tray-chip";
-    chip.innerHTML = `<span>${label}</span><button class="x" aria-label="Remove ${label}">×</button>`;
+    chip.innerHTML = `<span>${escapeHtml(label)}</span><button class="x" aria-label="Remove ${escapeHtml(label)}">×</button>`;
     chip.querySelector(".x").addEventListener("click", () => { selected.delete(id); renderTray(); renderPickList(); });
     host.appendChild(chip);
   });
@@ -224,6 +214,12 @@ function verdictBlock(a) {
     none:        { badge: "NO KNOWN PATH", title: "No known takeover path from these permissions.",
                    sub: "Nothing here maps to a known Global Admin escalation. That is not the same as “safe.” Reach can still be large." },
   }[a.sev];
+  // Direct only through lockout permissions: Global-Admin-level impact, but not Global Admin's privileges.
+  if (a.sev === "direct" && isLockoutOnly(a)) {
+    cfg.badge = "YES: LOCKOUT";
+    cfg.title = "This app can lock everyone out of the tenant.";
+    cfg.sub = "It can't make itself Global Admin, but it can block or remove every account, break-glass included, and hold the tenant to ransom. Researchers rate that as Global-Admin-level impact.";
+  }
   let why = "";
   const reasons = a.sev === "direct" ? a.directReasons : a.sev === "conditional" ? a.condReasons : [];
   if (reasons.length) {
@@ -451,7 +447,7 @@ function normalizeTenant(raw) {
 // ============================================================================
 function analyzeTenant(raw, opts) {
   const { tenantId, generatedAt, sps, groups } = normalizeTenant(raw);
-  const now = Date.now();
+  const now = (opts && opts.now) || Date.now();
   const haveGroupData = Array.isArray(groups) && groups.length > 0;
   // a bare yyyy-mm-dd parses as UTC midnight; anchor to local midnight instead
   const sinceTs = (opts && opts.since) ? credTime(/^\d{4}-\d{2}-\d{2}$/.test(opts.since) ? opts.since + "T00:00:00" : opts.since) : null;
@@ -494,9 +490,7 @@ function analyzeTenant(raw, opts) {
     // ---- group-write capability (BloodHound post-processing rules) ----
     // Plain group-write perms reach ONLY non-role-assignable groups.
     sp.canWriteOpenGroups =
-      permIds.has("Group.ReadWrite.All") || permIds.has("GroupMember.ReadWrite.All") ||
-      permIds.has("Directory.ReadWrite.All") ||
-      roleIds.has("Groups Administrator") || roleIds.has("User Administrator");
+      sp.perms.concat(sp.roleObjs).some(x => x.writesOpenGroups);
     // RoleManagement.ReadWrite.Directory reaches ALL groups incl. role-assignable
     // (but it's already a direct GA escalator, so it doesn't need the group path).
 
@@ -518,19 +512,22 @@ function analyzeTenant(raw, opts) {
 
     // base: reaches Global Admin on its own (tenant-independent + already-held group roles)?
     sp.baseGA = sp.analysis.sev === "direct"
-      || permIds.has("AppRoleAssignment.ReadWrite.All")
+      || sp.perms.some(p => p.selfEscalates)          // grants itself a Direct permission
       || !!sp.memberPrivGroup                  // already a member of a GA-carrying group
       || !!sp.ownsPrivGroup;                   // owns a GA-carrying group -> can add itself
     sp.reachesGA = sp.baseGA;
+    // Direct only through lockout (availability) permissions: Global-Admin-level
+    // impact, not Global Admin's privileges. Anything else that reaches GA wins.
+    sp.lockoutOnly = sp.baseGA && isLockoutOnly(sp.analysis)
+      && !sp.perms.some(p => p.selfEscalates) && !sp.memberPrivGroup && !sp.ownsPrivGroup;
     sp.gaProof = null;
     sp.groupProof = null;
     if (sp.memberPrivGroup) sp.groupProof = { group: sp.memberPrivGroup, how: "is already a member of" };
     else if (sp.ownsPrivGroup) sp.groupProof = { group: sp.ownsPrivGroup, how: "owns (can add itself to)" };
 
     // app-credential backdoor capability
-    sp.canModAll = permIds.has("Application.ReadWrite.All")
-      || roleIds.has("Application Administrator") || roleIds.has("Cloud Application Administrator");
-    sp.canModOwned = permIds.has("Application.ReadWrite.OwnedBy");
+    sp.canModAll = sp.perms.concat(sp.roleObjs).some(x => x.plantsCredentials === "any");
+    sp.canModOwned = sp.perms.some(p => p.plantsCredentials === "owned");
 
     sp.credFlags = credentialFlags(sp, now, sinceTs);
   });
@@ -565,15 +562,16 @@ function analyzeTenant(raw, opts) {
   while (changed && guard++ < 16) {
     changed = false;
     sps.forEach(sp => {
-      if (sp.reachesGA) return;
+      if (sp.reachesGA && !sp.lockoutOnly) return;
       let appTargets = [];
       if (sp.canModAll) appTargets = sps.filter(o => o !== sp);
       else if (sp.canModOwned) appTargets = (sp.ownedAppIds || []).map(a => byAppId[a]).filter(Boolean);
       // ownership edge: apps this SP owns, it can backdoor
       appTargets = appTargets.concat(sp.ownsAppObjs || []);
-      const appProof = appTargets.find(o => o.reachesGA);
+      const appProof = appTargets.find(o => o.reachesGA && !o.lockoutOnly)
+        || (sp.reachesGA ? null : appTargets.find(o => o.reachesGA));
       if (appProof) {
-        sp.reachesGA = true; sp.gaProof = appProof;
+        sp.reachesGA = true; sp.gaProof = appProof; sp.lockoutOnly = !!appProof.lockoutOnly;
         if ((sp.ownsAppObjs||[]).includes(appProof) && !sp.canModAll && !sp.canModOwned) sp.gaViaOwnership = true;
         changed = true;
       }
@@ -601,7 +599,7 @@ function analyzeTenant(raw, opts) {
   sps.forEach(sp => {
     if (sp.reachesGA) {
       sp.finalSev = "direct";
-      const selfDirect = sp.analysis.sev === "direct" || sp.perms.some(p=>p.id==="AppRoleAssignment.ReadWrite.All");
+      const selfDirect = sp.analysis.sev === "direct" || sp.perms.some(p => p.selfEscalates);
       // "confirmedViaChain" means proven by the app-credential backdoor path specifically
       sp.confirmedViaChain = !selfDirect && !!sp.gaProof;
       // group-confirmed is tracked separately via sp.groupProof
@@ -622,8 +620,8 @@ function analyzeTenant(raw, opts) {
         if (onlyGroupCond && sp.canWriteOpenGroups) {
           const n = rolePrivGroups.length;
           sp.groupCleared = n
-            ? `Group data reviewed: the ${n} privileged group${n>1?"s":""} in this tenant ${n>1?"are":"is"} role-assignable, which plain group-write cannot modify. No confirmed directory-role path. (A non-role-assignable group could still grant access via app-role or access-package assignments, which this export does not capture.)`
-            : `Group data reviewed: no group in this tenant carries a privileged directory role. (A non-role-assignable group could still grant access via app-role or access-package assignments, which this export does not capture.)`;
+            ? `Group data reviewed: the ${n} privileged group${n>1?"s":""} in this tenant ${n>1?"are":"is"} role-assignable, which plain group-write cannot modify. No confirmed directory-role path. (A non-role-assignable group could still grant access via app-role assignments, Azure role assignments or access packages, which this export does not capture.)`
+            : `Group data reviewed: no group in this tenant carries a privileged directory role. (A non-role-assignable group could still grant access via app-role assignments, Azure role assignments or access packages, which this export does not capture.)`;
         }
       }
     }
@@ -637,7 +635,8 @@ function analyzeTenant(raw, opts) {
     disabled: sps.filter(s => !s.enabled).length,
     vendor: sps.filter(s => s.appType === "multi-tenant").length,
     own: sps.filter(s => s.appType === "single-tenant").length,
-    ga: sps.filter(s => s.finalSev === "direct").length,
+    ga: sps.filter(s => s.finalSev === "direct" && !s.lockoutOnly).length,
+    lockout: sps.filter(s => s.finalSev === "direct" && s.lockoutOnly).length,
     gaChained: sps.filter(s => s.confirmedViaChain || (s.groupProof && s.groupProof.how.startsWith("owns"))).length,
     conditional: sps.filter(s => s.finalSev === "conditional").length,
     withRoles: sps.filter(s => s.roleObjs.length).length,
@@ -652,7 +651,12 @@ function analyzeTenant(raw, opts) {
     privGroups: (groups || []).filter(g => g.rolePrivileged).length,
   };
 
-  return { tenantId, generatedAt, sps, roll, byAppId, groups: groups || [], haveGroupData };
+  // Gaps in the export that switch checks off. Say so where results are shown,
+  // because a check that couldn't run looks exactly like a clean result.
+  const warnings = [];
+  if (!tenantId) warnings.push({ code: "no-tenant-id",
+    text: "This export has no tenantId, so vendor apps can't be told apart from your own. The cross-tenant credential checks (vendor-owned and Microsoft first-party service principals) did not run, and their count of 0 is not a clean result. Re-run the export script, which records tenantId." });
+  return { tenantId, generatedAt, sps, roll, byAppId, groups: groups || [], haveGroupData, warnings };
 }
 
 // Returns an array of { text, sev, why } flags. sev: "high" | "med".
@@ -691,11 +695,11 @@ function credentialFlags(sp, now, sinceTs) {
     if (!isMs && !alEntry) {
       flags.push({ code: "xtenant", sev: "high",
         text: `Tenant-side credential on a vendor (externally-owned) app`,
-        why: `This service principal is owned by another tenant (${escapeHtml(String(sp.ownerOrg))}), yet carries ${all.length} credential(s) in yours. Vendor credentials normally live in the vendor's tenant. A credential here matches the known persistence pattern (attacker-planted secret). Review and remove if you did not create it.` });
+        why: `This service principal is owned by another tenant (${String(sp.ownerOrg)}), yet carries ${all.length} credential(s) in yours. Vendor credentials normally live in the vendor's tenant. A credential here matches the known persistence pattern (attacker-planted secret). Review and remove if you did not create it.` });
     } else if (alEntry) {
       flags.push({ code: "xtenant-allow", sev: "med",
         text: `Cross-tenant credential (allowlisted)`,
-        why: `A tenant-side credential on this external app would normally flag, but it is on the allowlist: "${escapeHtml(alEntry.reason||"no reason given")}". Re-confirm this is still intended.` });
+        why: `A tenant-side credential on this external app would normally flag, but it is on the allowlist: "${alEntry.reason||"no reason given"}". Re-confirm this is still intended.` });
     }
   }
 
@@ -712,7 +716,7 @@ function credentialFlags(sp, now, sinceTs) {
       const years = (end - start) / (365.25 * 864e5);
       const cName = c.displayName || c.DisplayName;
       if (years > 2) flags.push({ code: "longlived", sev: "med",
-        text: `Long-lived ${c.kind} (${years.toFixed(1)} yr)${cName ? ' “'+escapeHtml(cName)+'”' : ""}`,
+        text: `Long-lived ${c.kind} (${years.toFixed(1)} yr)${cName ? ' “'+cName+'”' : ""}`,
         why: `A multi-year credential${srcLabel} is ideal for persistence; short lifetimes limit a stolen secret's window.` });
     }
     if (start && now && start > now - 14 * 864e5) flags.push({ code: "recent", sev: "med",
@@ -734,7 +738,7 @@ function credentialFlags(sp, now, sinceTs) {
 
 function pimSentence(sp) {
   const how = sp.pimGroup
-    ? `through the group “${escapeHtml(sp.pimGroup.name)}”, which is PIM-eligible for a Global Admin-equivalent role`
+    ? `through the group “${sp.pimGroup.name}”, which is PIM-eligible for a Global Admin-equivalent role`
     : "by activating a PIM-eligible role";
   return `Reaches Global Admin only ${how}. Activation is a gated, logged step (often MFA plus approval), not standing access. Still a path, but weaker than a standing assignment.`;
 }
@@ -794,12 +798,14 @@ function rollupBlock(d) {
     : "";
   const blindspot = `<div class="blindspot"><span class="bs-ic">◐</span><div><b>What this can't see.</b> It reasons only from what's in the export: it doesn't log in, confirm activity, or capture app-role/access-package grants on non-role-assignable groups or Azure RBAC. “No known path” means nothing in the knowledge base matched for the data provided, not that an app is safe.</div></div>`;
   el.innerHTML = `<h3>Tenant rollup</h3>
-    <p class="rsub">${r.total} apps analyzed${d.tenantId ? ` in tenant ${d.tenantId}` : ""}. ${meta}</p>
+    <p class="rsub">${r.total} apps analyzed${d.tenantId ? ` in tenant ${escapeHtml(d.tenantId)}` : ""}. ${meta}</p>
+    ${(d.warnings || []).map(w => `<div class="blindspot" data-warning="${escapeHtml(w.code)}"><span class="bs-ic">⚠</span><div><b>Check not run.</b> ${escapeHtml(w.text)}</div></div>`).join("")}
     <div class="stat-grid">
       ${stat(r.ga, "can reach Global Admin", r.ga ? "alarm" : "")}
+      ${r.lockout ? stat(r.lockout, "can lock the tenant (GA-level impact)", "alarm") : ""}
       ${stat(r.gaChained, "only via a backdoor/group chain", r.gaChained ? "alarm" : "")}
       ${stat(r.pimGa, "GA via PIM activation (gated)", r.pimGa ? "warn" : "")}
-      ${stat(r.crossTenantCreds, "cross-tenant credentials", r.crossTenantCreds ? "alarm" : "")}
+      ${d.tenantId ? stat(r.crossTenantCreds, "cross-tenant credentials", r.crossTenantCreds ? "alarm" : "") : stat("n/a", "cross-tenant credentials (not checked)", "warn")}
       ${stat(r.conditional, "conditional (unverified)", r.conditional ? "warn" : "")}
       ${stat(r.withRoles, "hold a directory role", r.withRoles ? "warn" : "")}
       ${stat(r.suspCreds, "credential concerns", r.suspCreds ? "warn" : "")}
@@ -852,7 +858,7 @@ function paintAppRows(d) {
 
 function appRow(sp) {
   const sev = sp.finalSev;
-  const verdict = sev === "direct" ? (sp.viaPim ? "GA · PIM-GATED" : "GLOBAL ADMIN") : sev === "conditional" ? "CONDITIONAL" : "NO KNOWN PATH";
+  const verdict = sev === "direct" ? (sp.viaPim ? "GA · PIM-GATED" : sp.lockoutOnly ? "LOCKOUT · GA-LEVEL" : "GLOBAL ADMIN") : sev === "conditional" ? "CONDITIONAL" : "NO KNOWN PATH";
   const badges = [];
   badges.push(sp.appType === "multi-tenant" ? `<span class="abadge vendor">vendor</span>` : `<span class="abadge own">own app</span>`);
   if (!sp.enabled) badges.push(`<span class="abadge disabled">disabled</span>`);
@@ -870,7 +876,7 @@ function appRow(sp) {
       <span class="app-dot ${sev}"></span>
       <span class="app-id-wrap">
         <div class="app-name">${escapeHtml(sp.name)}</div>
-        <div class="app-sub">${sp.appId || "no app id"}</div>
+        <div class="app-sub">${escapeHtml(sp.appId || "no app id")}</div>
       </span>
       <span class="app-badges">${badges.join("")}</span>
       <span class="app-verdict ${sev}">${verdict}</span>
@@ -896,7 +902,7 @@ function appDetail(sp) {
       html += proofChain(sp);
     } else {
       const reasons = sp.analysis.directReasons.length ? sp.analysis.directReasons
-        : sp.perms.filter(p => p.id === "AppRoleAssignment.ReadWrite.All");
+        : sp.perms.filter(p => p.selfEscalates);
       html += `<div style="font-size:12.5px;color:var(--text-dim)">`;
       reasons.slice(0,4).forEach(r => { html += `• <code style="font-family:var(--mono);color:var(--text)">${r.id}</code>: ${r.escalationNote || r.plain}<br>`; });
       if (sp.roleObjs.some(r=>r.escalation==="direct")) sp.roleObjs.filter(r=>r.escalation==="direct").forEach(r => html += `• role <code style="font-family:var(--mono);color:var(--text)">${r.id}</code>: ${r.escalationNote}<br>`);
@@ -929,9 +935,9 @@ function appDetail(sp) {
     sp.roleObjs.forEach(r => html += `<span class="mini-chip ${r.escalation==="direct"?"hot":""}">${escapeHtml(r.id)}</span>`);
     (sp.roleObjsEligible||[]).forEach(r => html += `<span class="mini-chip ${r.escalation==="direct"?"hot":""}" title="Eligible via PIM; requires activation">${escapeHtml(r.id)} · PIM-eligible</span>`);
     html += `</div>`;
-    if (sp.viaPim) html += `<div style="font-size:12px;color:var(--caution);margin-top:7px">${pimSentence(sp)}</div>`;
+    if (sp.viaPim) html += `<div style="font-size:12px;color:var(--caution);margin-top:7px">${escapeHtml(pimSentence(sp))}</div>`;
   } else if (sp.viaPim) {
-    html += `<div class="sec-t">Directory roles</div><div style="font-size:12px;color:var(--caution)">${pimSentence(sp)}</div>`;
+    html += `<div class="sec-t">Directory roles</div><div style="font-size:12px;color:var(--caution)">${escapeHtml(pimSentence(sp))}</div>`;
   }
 
   // 3b. ownership paths
@@ -964,7 +970,7 @@ function proofChain(sp) {
   let cur = sp.gaProof, guard = 0;
   while (cur && guard++ < 12) {
     const why = cur.baseGA
-      ? (cur.analysis.directReasons[0]?.id || "AppRoleAssignment.ReadWrite.All")
+      ? (cur.analysis.directReasons[0]?.id || (cur.perms.find(p => p.selfEscalates) || {}).id || "a self-escalating permission")
       : (cur.canModAll ? "can add a credential to any app" : "backdoors another app");
     nodes.push({ name: cur.name, why, ga: cur.baseGA });
     if (cur.baseGA) break;
@@ -1055,9 +1061,9 @@ function extractRoleTokens(x) {
   return [];
 }
 
-function analyzePartner(raw) {
+function analyzePartner(raw, opts) {
   const { partnerTenantId, generatedAt, rels, assigns, groups, principals } = normalizePartner(raw);
-  const now = Date.now();
+  const now = (opts && opts.now) || Date.now();
 
   const groupById = {};
   groups.forEach(g => { if (g.id) groupById[g.id] = g; });
@@ -1184,7 +1190,7 @@ function partnerRollupBlock(d) {
   const stat = (num, lbl, cls="") => `<div class="stat ${cls}"><div class="num">${num}</div><div class="lbl">${lbl}</div></div>`;
   const meta = d.generatedAt ? `exported ${new Date(d.generatedAt).toLocaleString()}` : "";
   el.innerHTML = `<h3>Partner cross-tenant reach</h3>
-    <p class="rsub">${r.customers} customer tenant${r.customers===1?"":"s"} reachable from this partner${d.partnerTenantId ? ` (${d.partnerTenantId})` : ""}. ${meta}</p>
+    <p class="rsub">${r.customers} customer tenant${r.customers===1?"":"s"} reachable from this partner${d.partnerTenantId ? ` (${escapeHtml(d.partnerTenantId)})` : ""}. ${meta}</p>
     <div class="stat-grid">
       ${stat(r.fullTakeover, "customers fully takeable (GA-equiv reachable)", r.fullTakeover ? "alarm" : "")}
       ${stat(r.legacyDap, "legacy DAP (standing GA)", r.legacyDap ? "alarm" : "")}
@@ -1272,7 +1278,7 @@ function custRow(c) {
       <span class="app-dot ${c.sev}"></span>
       <span style="flex:1;min-width:0">
         <div class="cust-name">${escapeHtml(c.name)}</div>
-        <div class="cust-sub">${c.id || "no tenant id"}</div>
+        <div class="cust-sub">${escapeHtml(c.id || "no tenant id")}</div>
       </span>
       <span class="cust-badges"><span class="relstat ${c.relstat}">${relLabel}</span></span>
       <span class="cust-verdict ${c.sev}">${verdict}</span>
@@ -1392,7 +1398,7 @@ function printReport(mode) {
 // ---- report HTML builder (light theme, system fonts, print CSS) ----
 function reportHead(title) {
   return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${escapeHtml(title)}</title>
 <style>
@@ -1455,8 +1461,7 @@ function reportHead(title) {
   @media (max-width:640px){ .stats { grid-template-columns:repeat(2,1fr); } .page{padding:24px 20px;} .toolbar{padding:12px 20px;} }
 </style></head><body>
 <div class="toolbar">
-  <button class="primary" onclick="window.print()">Print / Save as PDF</button>
-  <span class="tnote">Opens your browser's print dialog. Choose “Save as PDF” as the destination.</span>
+  <span class="tnote"><b>To print or save as PDF:</b> press Ctrl+P (⌘P on a Mac) and choose “Save as PDF” as the destination. This report contains no scripts.</span>
 </div>
 <div class="page">`;
 }
@@ -1504,6 +1509,8 @@ function reportSingle(title) {
   const a = singleData;
   if (!a) return reportHead(title) + "<p>Run an analysis first.</p>" + reportFoot();
   const cfg = verdictCfgReport(a.sev);
+  if (a.sev === "direct" && isLockoutOnly(a)) Object.assign(cfg, { badge: "CAN LOCK THE TENANT",
+    t: "Every account can be locked out.", s: "No path to Global Admin's privileges, but it can block or remove every account, break-glass included: Global-Admin-level impact on availability." });
   const typeLabel = a.appType === "multi-tenant" ? "Vendor (multi-tenant)" : "Single-tenant (your own)";
   let html = reportHead(title);
   html += reportHeader(title, `<b>Scope:</b> a single ${typeLabel} application · ${a.perms.length} permission(s), ${a.roles.length} directory role(s) analyzed`);
@@ -1565,9 +1572,10 @@ function reportTenant(title) {
   html += reportHeader(title, `<b>Scope:</b> ${r.total} applications in ${d.tenantId ? "tenant " + escapeHtml(d.tenantId) : "the tenant"}${d.haveGroupData ? ` · ${r.groupCount} groups included` : ""}`);
 
   html += `<h2 class="sec">Executive summary</h2>`;
+  (d.warnings || []).forEach(w => { html += `<p style="border-left:3px solid var(--amber);background:var(--amberbg);padding:8px 12px"><b>Check not run.</b> ${escapeHtml(w.text)}</p>`; });
   html += `<p class="lede">Of ${r.total} applications analyzed, <b>${r.ga}</b> can reach Global Administrator` +
     (r.gaChained ? ` (${r.gaChained} only by chaining through another app or a group)` : "") +
-    `. ${r.conditional} more are conditional, ${r.withRoles} hold a directory role, and ${r.suspCreds} carry credential-hygiene concerns. ` +
+    `.` + (r.lockout ? ` ${r.lockout} more can lock every account out of the tenant (Global-Admin-level impact on availability, without Global Admin's privileges).` : "") + ` ${r.conditional} more are conditional, ${r.withRoles} hold a directory role, and ${r.suspCreds} carry credential-hygiene concerns. ` +
     `${r.vendor} are vendor (multi-tenant) apps whose credential you cannot rotate.` +
     (r.pimGa ? ` ${r.pimGa} of the Global Admin paths ${r.pimGa>1?"are":"is"} PIM-gated: reachable only through a logged activation.` : "") +
     (r.crossTenantCreds ? ` <b>${r.crossTenantCreds} ${r.crossTenantCreds>1?"apps carry":"app carries"} a credential on a vendor or Microsoft-owned service principal, the persistence pattern from the ConnectWise incident.</b>` : "") +
@@ -1576,6 +1584,7 @@ function reportTenant(title) {
 
   html += `<div class="stats">
     ${rstat(r.ga,"reach Global Admin",r.ga?"red":"")}
+    ${r.lockout ? rstat(r.lockout,"can lock the tenant",'red') : ""}
     ${rstat(r.gaChained,"via a backdoor/group chain",r.gaChained?"red":"")}
     ${rstat(r.pimGa,"GA via PIM activation",r.pimGa?"amber":"")}
     ${rstat(r.crossTenantCreds,"cross-tenant credentials",r.crossTenantCreds?"red":"")}
@@ -1596,7 +1605,7 @@ function reportTenant(title) {
       else if (sp.groupProof) { const g = sp.groupProof.group; why = `${sp.groupProof.how} the ${g.roleAssignable?"role-assignable ":""}group “${escapeHtml(g.name)}”, which holds a privileged role`; }
       else if (sp.gaViaOwnership && sp.gaProof) why = `owns the more privileged app “${escapeHtml(sp.gaProof.name)}” and can add a credential to it`;
       else if (sp.confirmedViaChain && sp.gaProof) why = `can plant a credential on the more privileged app “${escapeHtml(sp.gaProof.name)}” and inherit it`;
-      else { const rr = (sp.analysis.directReasons[0]||sp.perms.find(p=>p.id==="AppRoleAssignment.ReadWrite.All")); why = rr ? `holds ${escapeHtml(rr.id)}` : (sp.roleObjs.find(x=>x.escalation==="direct") ? `holds the ${escapeHtml(sp.roleObjs.find(x=>x.escalation==="direct").id)} role` : "holds a direct-escalation permission"); }
+      else { const rr = (sp.analysis.directReasons[0]||sp.perms.find(p => p.selfEscalates)); why = rr ? `holds ${escapeHtml(rr.id)}` : (sp.roleObjs.find(x=>x.escalation==="direct") ? `holds the ${escapeHtml(sp.roleObjs.find(x=>x.escalation==="direct").id)} role` : "holds a direct-escalation permission"); }
       html += `<div class="finding red"><b>${escapeHtml(sp.name)}</b> <span class="muted">(${sp.appType==="multi-tenant"?"vendor":"own"}${sp.enabled?"":", disabled"})</span>: ${why}.</div>`;
     });
   }
@@ -1609,7 +1618,7 @@ function reportTenant(title) {
       const items = (sp.credFlags||[]).concat(sp.ownerFindings||[]);
       const red = items.some(f => f.sev === "high");
       html += `<div class="finding ${red?"red":"amber"}"><b>${escapeHtml(sp.name)}</b><ul style="margin:6px 0 0 18px;padding:0">` +
-        items.map(f => `<li><b>${escapeHtml(f.text)}.</b> ${f.why}</li>`).join("") + `</ul></div>`;
+        items.map(f => `<li><b>${escapeHtml(f.text)}.</b> ${escapeHtml(f.why)}</li>`).join("") + `</ul></div>`;
     });
   }
 
@@ -1617,7 +1626,7 @@ function reportTenant(title) {
   html += `<h2 class="sec">Application inventory</h2>`;
   html += `<table><thead><tr><th>Application</th><th>Type</th><th>Verdict</th><th>Roles</th><th>Flags</th></tr></thead><tbody>`;
   d.sps.slice().sort((a,b)=>b.riskScore-a.riskScore).forEach(sp => {
-    const v = sp.finalSev; const vl = v==="direct"?(sp.viaPim?"Global Admin (PIM-gated)":"Global Admin"):v==="conditional"?"Conditional":"No known path";
+    const v = sp.finalSev; const vl = v==="direct"?(sp.viaPim?"Global Admin (PIM-gated)":sp.lockoutOnly?"Lockout (Global-Admin-level impact)":"Global Admin"):v==="conditional"?"Conditional":"No known path";
     const flags = []; if (!sp.enabled) flags.push("disabled"); if (hasCrossTenantCred(sp)) flags.push("cross-tenant cred"); else if (sp.credFlags.length) flags.push("cred concern");
     if (sp.gaViaOwnership) flags.push("via ownership"); if (sp.ownerFindings && sp.ownerFindings.length) flags.push("human owner"); if (sp.groupProof) flags.push("via group"); if (sp.groupCleared) flags.push("group-cleared");
     html += `<tr><td><b>${escapeHtml(sp.name)}</b><br><span class="muted" style="font-size:11px">${escapeHtml(sp.appId||"")}</span></td>` +
@@ -1965,7 +1974,7 @@ function doTenantAnalyze(rawText) {
     const data = analyzeTenant(rawText, since ? { since } : undefined);
     data.since = since;
     note.className = "parse-note ok";
-    note.textContent = `Parsed ${data.roll.total} apps. ${data.roll.ga} can reach Global Admin.` + (since ? ` Showing changes since ${since}.` : "");
+    note.textContent = `Parsed ${data.roll.total} apps. ${data.roll.ga} can reach Global Admin.` + (data.roll.lockout ? ` ${data.roll.lockout} can lock the tenant.` : "") + (since ? ` Showing changes since ${since}.` : "");
     renderTenant(data);
   } catch (e) {
     note.className = "parse-note err";

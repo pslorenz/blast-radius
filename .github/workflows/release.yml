@@ -1,0 +1,135 @@
+name: release
+
+# Push a tag vX.Y.Z (matching TOOL_VERSION in kb.js) on a commit already on main.
+# The workflow re-runs every check, rebuilds, requires the rebuild to be byte-identical
+# to the committed files, attests provenance, and publishes the GitHub Release.
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  PLAYWRIGHT_VERSION: "1.63.0"
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # Add required reviewers to this environment (Settings > Environments) to make
+    # every release wait for a human approval before anything is signed or published.
+    environment: release
+    permissions:
+      contents: write          # create the release
+      id-token: write          # sign the provenance attestation (Sigstore)
+      attestations: write      # store it in the repo's attestation API
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          fetch-depth: 0       # needed to prove the tag is on main
+          persist-credentials: false
+
+      - name: Every action pinned to a commit SHA
+        run: python3 scripts/check_pinned_actions.py
+
+      - name: Tag is on main
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::${GITHUB_REF_NAME} points at a commit that is not on main. Merge first, then tag."
+            exit 1
+          fi
+
+      - name: Tag matches TOOL_VERSION
+        id: ver
+        run: |
+          tool=$(node -e 'const s=require("fs").readFileSync("kb.js","utf8");console.log(s.match(/const TOOL_VERSION = "([^"]+)"/)[1])')
+          kb=$(node -e 'const s=require("fs").readFileSync("kb.js","utf8");console.log(s.match(/const KB_VERSION = "([^"]+)"/)[1])')
+          if [ "v${tool}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match TOOL_VERSION ${tool} in kb.js."
+            exit 1
+          fi
+          echo "kb=${kb}" >> "$GITHUB_OUTPUT"
+
+      - name: CHANGELOG has an entry for this version
+        run: |
+          python3 - <<'PY'
+          import os, re, sys
+          v = os.environ["GITHUB_REF_NAME"]
+          text = open("CHANGELOG.md", encoding="utf-8").read()
+          m = re.search(rf"^## {re.escape(v)}\b.*?(?=^## |\Z)", text, flags=re.M | re.S)
+          if not m or len(m.group(0).strip().splitlines()) < 3:
+              sys.exit(f"::error::CHANGELOG.md has no '## {v}' section. Add one before tagging.")
+          open("changelog-section.md", "w", encoding="utf-8").write(m.group(0).split("\n", 1)[1].strip() + "\n")
+          PY
+
+      - name: Engine and hostile-input tests
+        run: node test/fixture.test.js && node test/hostile-input.test.js
+
+      - name: Rebuild; must be byte-identical to the committed files
+        run: |
+          python3 build.py
+          git diff --exit-code -- blast-radius-local.html blast-radius-public.html docs/index.html SHA256SUMS
+          sha256sum -c SHA256SUMS
+
+      - name: Browser tests
+        run: |
+          npm install --no-save --no-package-lock --ignore-scripts "playwright@${PLAYWRIGHT_VERSION}"
+          ok=
+          for i in 1 2 3; do
+            npx --no-install playwright install chromium && { ok=1; break; }
+            echo "::warning::Chromium download failed (attempt $i of 3), retrying"; sleep 20
+          done
+          [ -n "$ok" ]
+          node test/browser.test.js
+
+      - name: Attest build provenance
+        id: attest
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be  # v2
+        with:
+          subject-path: |
+            blast-radius-local.html
+            blast-radius-public.html
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          KB: ${{ steps.ver.outputs.kb }}
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+          REPO: ${{ github.repository }}
+        run: |
+          cp "$BUNDLE" "blast-radius-${TAG}.sigstore.json"
+          cat > notes.md <<NOTES
+          Blast Radius ${TAG} · knowledge base v${KB}
+
+          $(cat changelog-section.md)
+
+          **blast-radius-local.html** is the offline build (all three modes). Run it from a local file; don't host it publicly.
+          **blast-radius-public.html** is the before-you-consent build served on GitHub Pages.
+
+          ### Verify before you paste client data
+
+          Hashes:
+
+              sha256sum -c SHA256SUMS
+              Get-FileHash .\\blast-radius-local.html -Algorithm SHA256   # Windows; compare with SHA256SUMS
+
+          Provenance (proves the file was built by this repository's release workflow from tag ${TAG}):
+
+              gh attestation verify blast-radius-local.html --repo ${REPO} --signer-workflow ${REPO}/.github/workflows/release.yml
+
+          The \`blast-radius-${TAG}.sigstore.json\` asset is the same attestation, for use with \`--bundle\`.
+
+          Provenance proves origin and integrity, not correctness. The knowledge base version above is the research the verdicts rest on.
+          NOTES
+          gh release create "$TAG" \
+            --verify-tag \
+            --title "Blast Radius ${TAG}" \
+            --notes-file notes.md \
+            blast-radius-local.html blast-radius-public.html SHA256SUMS "blast-radius-${TAG}.sigstore.json"

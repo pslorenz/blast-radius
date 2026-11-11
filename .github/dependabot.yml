@@ -1,0 +1,11 @@
+# Proposes updates to the pinned action SHAs (keeping the "# vX.Y.Z" comments current).
+# Review each bump like code: an action runs with this repo's token, and in release.yml
+# with the permission to sign provenance.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 14

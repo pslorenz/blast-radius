@@ -7,9 +7,9 @@
 Also writes docs/index.html (the public build, for GitHub Pages) and SHA256SUMS,
 then runs integrity checks and exits non-zero if any fail.
 
-Usage:  python3 build.py [--out DIR]     (default: the repo directory)
+Usage:  py build.py [--out DIR]   (Windows; python3 build.py on macOS/Linux)
 """
-import hashlib, pathlib, re, shutil, sys
+import base64, hashlib, pathlib, re, shutil, sys
 
 SRC = pathlib.Path(__file__).resolve().parent
 OUT = SRC
@@ -32,6 +32,23 @@ def inline(h, public=False):
     h = h.replace('<script src="kb.js"></script>', "<script>\n" + kb + "\n</script>")
     h = h.replace('<script src="app.js"></script>', "<script>\n" + a + "\n</script>")
     return h
+
+def sha256_b64(text):
+    return base64.b64encode(hashlib.sha256(text.encode("utf-8")).digest()).decode()
+
+def lock_scripts(h, name):
+    """Swap script-src 'unsafe-inline' in the page CSP for hashes of the page's own
+    inline scripts. Only those exact scripts may run: injected markup can't add a
+    <script>, and inline event handlers (onerror=, onload=...) are blocked outright.
+    The analysis output is attacker-influenced (vendor-chosen display names), so
+    this makes an escaping bug inert instead of executable."""
+    old = "script-src 'unsafe-inline';"
+    i = h.find(old)
+    if i < 0 or i > h.find("<script>"):
+        sys.exit(f"build.py: {name}: no page CSP with script-src 'unsafe-inline' before the first <script>")
+    bodies = re.findall(r"<script>(.*?)</script>", h, flags=re.DOTALL)
+    hashes = " ".join(f"'sha256-{sha256_b64(b)}'" for b in bodies)
+    return h[:i] + f"script-src {hashes};" + h[i + len(old):]
 
 def must_replace(h, old, new, label):
     if old not in h:
@@ -84,6 +101,7 @@ local = must_replace(local, "<!DOCTYPE html>\n", "<!DOCTYPE html>\n" + DO_NOT_HO
 local = must_replace(local, '<body data-aud="tech">', '<body data-aud="tech" data-build="local">', "<body>")
 local = must_replace(local, MODE_SWITCH, LOCAL_BANNER + MODE_SWITCH, "the mode switch")
 local = inline(local)
+local = lock_scripts(local, "local")
 
 # ---------------------------------------------------------------------------
 # PUBLIC build: remove tenant-mode and partner-mode panels; lock their buttons
@@ -117,6 +135,7 @@ pub = must_replace(pub,
     </button>''', "the tenant/partner mode buttons")
 pub = must_replace(pub, MODE_SWITCH, PUBLIC_BANNER + MODE_SWITCH, "the mode switch")
 pub = inline(pub, public=True)
+pub = lock_scripts(pub, "public")
 
 # ---------------------------------------------------------------------------
 # Integrity checks: fail the build rather than ship a broken promise
@@ -131,6 +150,20 @@ for name, txt in (("local", local), ("public", pub)):
         problems.append(f"{name}: loads an external resource: {m.group(1)}")
     if "STRIP-PUBLIC" in txt:
         problems.append(f"{name}: leftover STRIP-PUBLIC sentinel")
+    csp = re.search(r'http-equiv="Content-Security-Policy" content="([^"]*)"', txt)
+    if csp and re.search(r"script-src[^;]*'unsafe-inline'", csp.group(1)):
+        problems.append(f"{name}: page CSP still allows 'unsafe-inline' scripts")
+    if txt.count("<script") != txt.count("<script>"):
+        problems.append(f"{name}: a <script> tag with attributes would not be covered by the CSP hashes")
+    for body in re.findall(r"<script>(.*?)</script>", txt, flags=re.DOTALL):
+        if not csp or f"'sha256-{sha256_b64(body)}'" not in csp.group(1):
+            problems.append(f"{name}: an inline script is missing from the CSP hashes and would not run")
+    if re.search(r"<[a-z][^>]*\son[a-z]+\s*=", txt.split("<script>", 1)[0] + "".join(re.split(r"<script>.*?</script>", txt, flags=re.DOTALL)[1:])):
+        problems.append(f"{name}: inline event handler attribute in the page markup (blocked by the hash CSP)")
+    if "\r" in txt:
+        problems.append(f"{name}: contains a carriage return; output must be LF-only")
+    if txt.encode("utf-8").find(b"charset") > 1000:
+        problems.append(f"{name}: <meta charset> is beyond the first 1024 bytes; browsers may mis-decode the file")
     if "\u2014" in txt:
         print(f"warning: {name} contains {txt.count(chr(0x2014))} em-dash(es)")
 for marker in ('id="tenant-mode"', 'id="partner-mode"', "const TENANT_SCRIPT", "const SAMPLE_TENANT", "function analyzeTenant"):
