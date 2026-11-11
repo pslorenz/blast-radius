@@ -68,7 +68,12 @@ jobs:
       - name: Install Playwright ${{ env.PLAYWRIGHT_VERSION }} and Chromium
         run: |
           npm install --no-save --no-package-lock --ignore-scripts "playwright@${PLAYWRIGHT_VERSION}"
-          npx --no-install playwright install --with-deps chromium
+          ok=
+          for i in 1 2 3; do
+            npx --no-install playwright install chromium && { ok=1; break; }
+            echo "::warning::Chromium download failed (attempt $i of 3), retrying"; sleep 20
+          done
+          [ -n "$ok" ]
       - name: Browser tests
         run: node test/browser.test.js
 
